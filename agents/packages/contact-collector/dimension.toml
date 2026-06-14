@@ -1,0 +1,13 @@
+[capabilities]
+storage = false
+agent_calls = false
+
+[resources]
+memory_mb = 256
+vcpus = 1
+timeout_secs = 30
+
+[a2a]
+name = "contact-collector"
+description = "Accepts an email address, first name, last name, and phone number. Returns a validated JSON object containing those fields. No LLM — pure extraction and validation."
+skills = ["contact-collection", "data-extraction"]

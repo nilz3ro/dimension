@@ -1,0 +1,86 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dimension
+      POSTGRES_USER: dimension
+      POSTGRES_PASSWORD: dimension
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dimension -d dimension"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./dev/clickhouse/users.d/default-user.xml:/etc/clickhouse-server/users.d/default-user.xml:ro
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  pulsar:
+    image: apachepulsar/pulsar:3.3.0
+    restart: unless-stopped
+    command: bin/pulsar standalone
+    volumes:
+      - pulsar_data:/pulsar/data
+    ports:
+      - "127.0.0.1:6650:6650"
+      - "127.0.0.1:8080:8080"
+
+  # Web UI for inspecting Pulsar (topics, subscriptions, messages).
+  # Attaches to the standalone broker above via the default compose network.
+  # UI at http://127.0.0.1:8090
+  dekaf:
+    image: visortelle/dekaf:1.1.0
+    restart: unless-stopped
+    depends_on:
+      - pulsar
+    environment:
+      DEKAF_PULSAR_NAME: "dimension"
+      DEKAF_PULSAR_BROKER_URL: "pulsar://pulsar:6650"
+      DEKAF_PULSAR_WEB_URL: "http://pulsar:8080"
+      # Base URL the browser uses; must match the document ORIGIN exactly
+      # or history.replaceState throws a cross-origin SecurityError.
+      # You reach this via Tailscale MagicDNS hostname "d2", not the IP.
+      DEKAF_PUBLIC_BASE_URL: "http://d2:8090"
+    volumes:
+      - dekaf_data:/dekaf/data/library
+    ports:
+      # Tailnet-only: bound to the tailscale0 IP, not exposed on the LAN.
+      - "100.64.168.32:8090:8090"
+
+  # Web UI for ClickHouse (SQL editor, schema browser, saved queries).
+  # Reaches ClickHouse over the internal compose network, so the DB itself
+  # stays bound to localhost. UI at http://d2:3488 (log in as user "default",
+  # empty password). Tailnet-only bind, same as dekaf.
+  ch-ui:
+    image: ghcr.io/caioricciuti/ch-ui:latest
+    restart: unless-stopped
+    depends_on:
+      - clickhouse
+    environment:
+      CLICKHOUSE_URL: "http://clickhouse:8123"
+    volumes:
+      - chui_data:/app/data
+    ports:
+      - "100.64.168.32:3488:3488"
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  pulsar_data:
+  dekaf_data:
+  chui_data:

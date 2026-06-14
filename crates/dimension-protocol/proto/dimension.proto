@@ -1,0 +1,431 @@
+syntax = "proto3";
+package dimension.protocol;
+
+// Top-level envelope for all wire messages.
+// Every frame on the wire is a length-delimited Envelope.
+message Envelope {
+  // Correlation ID linking request to response stream
+  string request_id = 1;
+
+  oneof payload {
+    Request request = 10;
+    DataChunk data_chunk = 11;
+    Error error = 12;
+    Done done = 13;
+    ShutdownRequest shutdown_request = 14;
+    ShutdownAck shutdown_ack = 15;
+
+    // Guest -> Host: outbound message emitted by the bundle (or synthesized
+    // by the agent) during a run. Forms the basis of the per-run event stream
+    // delivered to clients via SSE.
+    OutboundMessage outbound = 16;
+
+    // Platform service request/response (guest <-> host)
+    ServiceRequest service_request = 20;
+    ServiceResponse service_response = 21;
+  }
+}
+
+// Host -> Guest: initial request with opaque payload
+message Request {
+  bytes payload = 1;
+}
+
+// Guest -> Host: streaming data chunk
+message DataChunk {
+  bytes content = 1;
+  uint32 sequence = 2;
+  // Optional content type hint (e.g., "text", "json", "binary")
+  // Host may use for SSE event naming but does not require it
+  optional string content_type = 3;
+}
+
+// Either direction: error report
+message Error {
+  ErrorCode code = 1;
+  string message = 2;
+  // Structured detail for programmatic consumption
+  string detail = 3;
+  // Whether this error is terminal (stream should close)
+  bool terminal = 4;
+}
+
+// Guest -> Host: stream completion signal
+message Done {
+  // Optional summary metadata
+  map<string, string> metadata = 1;
+}
+
+// Guest -> Host: outbound message produced during a run.
+//
+// Sources:
+//   - Bundle code calling `dimension.send({...})` via the in-VM UDS at
+//     /run/dimension/events.sock (kind = "bundle").
+//   - The agent synthesizing lifecycle events from child stdout/stderr
+//     (kind = "stdout-final" | "stderr").
+//   - The worker emitting run-state events (kind = "state") with sequence
+//     numbers reserved on the host side.
+//
+// Sequence is monotonic per-run, assigned by the agent for guest-side
+// messages and by the worker for host-side state events.
+message OutboundMessage {
+  uint64 sequence = 1;
+  int64 timestamp_ms = 2;
+  // Free-form discriminator. Reserved values: "bundle", "state",
+  // "stdout-final", "stderr".
+  string kind = 3;
+  // MIME-style content type. Default "application/json".
+  string content_type = 4;
+  bytes body = 5;
+  // Free-form tags (e.g. tool_name, step_id).
+  map<string, string> attributes = 6;
+}
+
+// Host -> Guest: graceful shutdown request before SIGKILL.
+// Guest should flush writes, send ShutdownAck, then exit.
+// Host will SIGKILL after 5 seconds regardless.
+message ShutdownRequest {}
+
+// Guest -> Host: acknowledgement that the guest has flushed and is ready to die.
+// Host will SIGKILL immediately upon receiving this (no need to wait for the grace period).
+message ShutdownAck {}
+
+// Error code categories
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+
+  // Guest application errors (the workload itself failed)
+  ERROR_CODE_APPLICATION_ERROR = 1;
+  ERROR_CODE_INVALID_REQUEST = 2;
+  ERROR_CODE_TIMEOUT = 3;
+
+  // Infrastructure errors (protocol/transport layer)
+  ERROR_CODE_INTERNAL = 10;
+  ERROR_CODE_CODEC_ERROR = 11;
+  ERROR_CODE_MESSAGE_TOO_LARGE = 12;
+  ERROR_CODE_UNAVAILABLE = 13;
+}
+
+// ===========================================================================
+// Platform Service Protocol
+// ===========================================================================
+//
+// Guest -> Host service calls for secrets, storage, agents, sessions,
+// context, capabilities, and artifacts. Each operation has a dedicated
+// request/response pair wrapped in ServiceRequest/ServiceResponse.
+
+// ---------------------------------------------------------------------------
+// Capability claims (mirrors CapsClaims from auth.rs)
+// ---------------------------------------------------------------------------
+
+message Capabilities {
+  bool secrets = 1;
+  bool storage = 2;
+  bool agents = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Service error (returned inside ServiceResponse on failure)
+// ---------------------------------------------------------------------------
+
+message ServiceError {
+  int32 code = 1;
+  string message = 2;
+  string detail = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Secrets
+// ---------------------------------------------------------------------------
+
+message SecretGetRequest {
+  string name = 1;
+}
+
+message SecretGetResponse {
+  string name = 1;
+  string value = 2;
+}
+
+message SecretCreateRequest {
+  string name = 1;
+  string value = 2;
+}
+
+message SecretCreateResponse {
+  string name = 1;
+}
+
+message SecretResolveRequest {
+  string token = 1;
+}
+
+message SecretResolveResponse {
+  string token = 1;
+  string value = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+message StoragePutRequest {
+  string key = 1;
+  bytes data = 2;
+  optional string content_type = 3;
+}
+
+message StoragePutResponse {
+  string key = 1;
+  int64 size = 2;
+}
+
+message StorageGetRequest {
+  string key = 1;
+}
+
+message StorageGetResponse {
+  string key = 1;
+  bytes data = 2;
+}
+
+message StorageDeleteRequest {
+  string key = 1;
+}
+
+message StorageDeleteResponse {
+  string key = 1;
+}
+
+message StorageListRequest {
+  optional string prefix = 1;
+}
+
+message StorageObject {
+  string key = 1;
+  int64 size = 2;
+}
+
+message StorageListResponse {
+  repeated StorageObject objects = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Agents
+// ---------------------------------------------------------------------------
+
+message AgentSendRequest {
+  string target = 1;
+  string message = 2;
+  optional uint64 timeout_secs = 3;
+}
+
+message AgentSendResponse {
+  string response = 1;
+}
+
+message AgentListRequest {}
+
+message AgentInfo {
+  string name = 1;
+  string tag = 2;
+}
+
+message AgentListResponse {
+  repeated AgentInfo agents = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Session events
+// ---------------------------------------------------------------------------
+
+message SessionAppendEventRequest {
+  string role = 1;
+  string content = 2;
+}
+
+message SessionAppendEventResponse {}
+
+// ---------------------------------------------------------------------------
+// Context
+// ---------------------------------------------------------------------------
+
+message ContextGetRequest {}
+
+message ContextEvent {
+  string role = 1;
+  string content = 2;
+  string event_type = 3;
+  string timestamp = 4;
+}
+
+message ContextGetResponse {
+  string session_id = 1;
+  repeated ContextEvent events = 2;
+  string user = 3;
+  string bundle_id = 4;
+  string metadata_json = 5;
+}
+
+// Context update operations (oneof)
+message ContextSetMetadata {
+  string key = 1;
+  string metadata_json_value = 2;
+}
+
+message ContextSetMetadataAll {
+  string metadata_json = 1;
+}
+
+message ContextDeleteMessage {
+  int64 message_index = 1;
+}
+
+message ContextTrim {
+  int64 keep_last = 1;
+}
+
+message ContextSetMessages {
+  string messages_json = 1;
+}
+
+message ContextUpdateRequest {
+  oneof operation {
+    ContextSetMetadata set_metadata = 1;
+    ContextSetMetadataAll set_metadata_all = 2;
+    ContextDeleteMessage delete_message = 3;
+    ContextTrim trim = 4;
+    ContextSetMessages set_messages = 5;
+  }
+}
+
+message ContextUpdateResponse {
+  bool updated = 1;
+  optional string metadata_json = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Capabilities
+// ---------------------------------------------------------------------------
+
+message CapabilitiesGetRequest {}
+
+message CapabilitiesGetResponse {
+  bool secrets = 1;
+  bool storage = 2;
+  bool agents = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Artifacts
+// ---------------------------------------------------------------------------
+
+message ArtifactPublishRequest {
+  string key = 1;
+  bytes data = 2;
+  optional string content_type = 3;
+}
+
+message ArtifactPublishResponse {
+  string key = 1;
+  int64 size = 2;
+}
+
+message ArtifactListRequest {
+  optional int64 limit = 1;
+}
+
+message ArtifactInfo {
+  string key = 1;
+  int64 size = 2;
+  optional string content_type = 3;
+  string session_id = 4;
+  string created_at = 5;
+}
+
+message ArtifactListResponse {
+  repeated ArtifactInfo artifacts = 1;
+}
+
+// ---------------------------------------------------------------------------
+// ServiceRequest / ServiceResponse wrappers
+// ---------------------------------------------------------------------------
+
+// Guest -> Host: platform service request.
+// Carries identity context (bundle_id, user_id, session_id) and capabilities
+// alongside the specific operation request.
+message ServiceRequest {
+  string bundle_id = 1;
+  string user_id = 2;
+  string session_id = 3;
+  Capabilities capabilities = 4;
+
+  oneof request {
+    // Secrets (fields 10-12)
+    SecretGetRequest secret_get = 10;
+    SecretCreateRequest secret_create = 11;
+    SecretResolveRequest secret_resolve = 12;
+
+    // Storage (fields 13-16)
+    StoragePutRequest storage_put = 13;
+    StorageGetRequest storage_get = 14;
+    StorageDeleteRequest storage_delete = 15;
+    StorageListRequest storage_list = 16;
+
+    // Agents (fields 17-18)
+    AgentSendRequest agent_send = 17;
+    AgentListRequest agent_list = 18;
+
+    // Session (field 19)
+    SessionAppendEventRequest session_append_event = 19;
+
+    // Context (fields 20-21)
+    ContextGetRequest context_get = 20;
+    ContextUpdateRequest context_update = 21;
+
+    // Capabilities (field 22)
+    CapabilitiesGetRequest capabilities_get = 22;
+
+    // Artifacts (fields 23-24)
+    ArtifactPublishRequest artifact_publish = 23;
+    ArtifactListRequest artifact_list = 24;
+  }
+}
+
+// Host -> Guest: platform service response.
+// Contains either a successful operation response or a ServiceError.
+message ServiceResponse {
+  oneof response {
+    // Secrets (fields 10-12)
+    SecretGetResponse secret_get = 10;
+    SecretCreateResponse secret_create = 11;
+    SecretResolveResponse secret_resolve = 12;
+
+    // Storage (fields 13-16)
+    StoragePutResponse storage_put = 13;
+    StorageGetResponse storage_get = 14;
+    StorageDeleteResponse storage_delete = 15;
+    StorageListResponse storage_list = 16;
+
+    // Agents (fields 17-18)
+    AgentSendResponse agent_send = 17;
+    AgentListResponse agent_list = 18;
+
+    // Session (field 19)
+    SessionAppendEventResponse session_append_event = 19;
+
+    // Context (fields 20-21)
+    ContextGetResponse context_get = 20;
+    ContextUpdateResponse context_update = 21;
+
+    // Capabilities (field 22)
+    CapabilitiesGetResponse capabilities_get = 22;
+
+    // Artifacts (fields 23-24)
+    ArtifactPublishResponse artifact_publish = 23;
+    ArtifactListResponse artifact_list = 24;
+
+    // Error (field 30)
+    ServiceError error = 30;
+  }
+}

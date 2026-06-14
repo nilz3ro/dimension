@@ -1,0 +1,1 @@
+ALTER TABLE volumes ADD COLUMN last_accessed TIMESTAMPTZ NOT NULL DEFAULT now();

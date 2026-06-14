@@ -1,0 +1,13 @@
+# Cross-compilation configuration for dimension-agent guest binary.
+#
+# To add the musl target:
+#   rustup target add x86_64-unknown-linux-musl
+#
+# To build the static agent binary:
+#   cargo build --release --target x86_64-unknown-linux-musl -p dimension-agent
+
+[target.x86_64-unknown-linux-musl]
+# macOS with homebrew-musl-cross (brew install filosottile/musl-cross/musl-cross):
+# linker = "x86_64-linux-musl-gcc"
+# Linux with musl-tools (apt install musl-tools):
+# linker = "musl-gcc"

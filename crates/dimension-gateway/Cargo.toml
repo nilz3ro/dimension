@@ -1,0 +1,67 @@
+[package]
+name = "dimension-gateway"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dimension-server"
+path = "src/main.rs"
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+parking_lot = "0.12"
+dimension-store = { path = "../dimension-store" }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+bytes = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+axum = { workspace = true, features = ["multipart"] }
+tar = { workspace = true }
+tempfile = { workspace = true }
+clap = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+hyphae-core = { workspace = true }
+hyphae-errors = { workspace = true }
+nix = { workspace = true }
+getrandom = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+opendal = { version = "0.55", features = ["services-s3"] }
+jsonwebtoken = { workspace = true }
+cron = { workspace = true }
+regex = { workspace = true }
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+anyhow = { workspace = true }
+bytesize = { workspace = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper = { version = "1", features = ["client", "http1"] }
+askama = "0.15"
+askama_web = { version = "0.15", features = ["axum-0.8"] }
+clickhouse = { version = "0.14", features = ["uuid"] }
+pulsar = { version = "6", default-features = false, features = ["tokio-runtime", "compression"] }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+http-body-util = "0.1"
+reqwest = { workspace = true, features = ["json"] }
+which = { workspace = true }

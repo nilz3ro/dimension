@@ -1,0 +1,117 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+exclude = ["crates/dimension-gateway/tests/fixtures/echo-app", "test-agent", "tests/e2e", "crates/telegram-bridge"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+# Protobuf
+prost = "0.14"
+prost-build = "0.14"
+protox = "0.9"
+tonic = "0.14.5"
+tonic-prost = "0.14.5"
+tonic-build = "0.14"
+tonic-prost-build = "0.14.5"
+
+# Bytes / IO
+bytes = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tokio-vsock = "0.7"
+tokio-stream = "0.1"
+futures = "0.3"
+futures-util = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter", "json"], default-features = false }
+
+# Error handling
+thiserror = "2"
+anyhow = "1.0"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# HTTP / Web
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "request-id", "trace"] }
+reqwest = { version = "0.13", features = ["stream", "rustls", "multipart", "json"], default-features = false }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# IDs / Time
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# System
+nix = { version = "0.31", features = ["signal", "process", "user", "fs"] }
+libc = "0.2"
+which = "8.0"
+
+# TOML parsing (bundle manifest)
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+
+# Cron expression parsing
+cron = "0.15"
+
+# Regular expressions
+regex = "1"
+
+# Storage
+rusqlite = { version = "0.38", features = ["bundled"] }
+rusqlite_migration = "2.4"
+sqlx-core = { version = "=0.8.0", features = ["uuid", "chrono", "migrate", "_rt-tokio"] }
+sqlx-postgres = { version = "=0.8.0", features = ["uuid", "chrono", "migrate"] }
+base64 = "0.22"
+
+# Docker
+bollard = "0.18"
+tar = "0.4"
+
+# Filesystem
+tempfile = "3.14"
+walkdir = "2"
+fs_extra = "1"
+dirs = "6.0"
+cargo_metadata = "0.23"
+bytesize = "1"
+
+# Crypto / Hashing
+sha2 = "0.10"
+hex = "0.4"
+getrandom = "0.2"
+jsonwebtoken = "9"
+
+# Binary inspection
+elf = "0.8"
+
+# Retry / backoff
+backon = "1.6"
+
+# CLI display
+comfy-table = "7"
+indicatif = "0.18"
+
+# Workspace crates
+hyphae-core = { path = "crates/hyphae-core" }
+hyphae-errors = { path = "crates/hyphae-errors" }
+dimension-store = { path = "crates/dimension-store" }
+
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"
+codegen-units = 1

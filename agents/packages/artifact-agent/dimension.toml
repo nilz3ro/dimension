@@ -1,0 +1,7 @@
+[capabilities]
+storage = true
+
+[resources]
+memory_mb = 512
+vcpus = 1
+timeout_secs = 120

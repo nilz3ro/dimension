@@ -1,0 +1,16 @@
+[package]
+name = "dimension-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tokio-vsock = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+dimension-protocol = { path = "../dimension-protocol" }

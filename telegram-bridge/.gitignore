@@ -1,0 +1,7 @@
+node_modules/
+dist/
+
+# Runtime SQLite database — must not be committed (can capture queued message bodies)
+*.db
+*.db-shm
+*.db-wal

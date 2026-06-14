@@ -1,0 +1,5 @@
+node_modules
+dist
+*.ogg
+*.mp3
+gsd/

@@ -1,0 +1,34 @@
+[package]
+name = "dimension-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+sqlx-core = { workspace = true }
+sqlx-postgres = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+getrandom = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+opendal = { version = "0.55", features = ["services-s3", "services-memory"] }
+bytes = { workspace = true }
+
+# DEBT-01 note: This crate uses runtime `query_as::<_, T>(sql)` (not compile-time `query_as!` macros),
+# so `cargo sqlx prepare` / SQLX_OFFLINE=true is not applicable without migrating all queries to
+# macro form. DEBT-01 is instead implemented as an integration test gate in
+# tests/schema_validation.rs that exercises all FromRow impls against a live Postgres.
+# Path A (sqlx macros + .sqlx/) was not pursued because the `sqlx` umbrella crate's `macros`
+# feature pulls in `sqlx-sqlite` -> `libsqlite3-sys`, conflicting with `rusqlite bundled`
+# in the hyphae-core crate. Using `sqlx-core`/`sqlx-postgres` directly avoids this conflict.
+
+[dev-dependencies]
+tokio = { workspace = true }
+futures = { workspace = true }
+# testcontainers-modules = { version = "0.15", features = ["postgres"] }  # Deferred: conflicts with bollard v0.18 workspace dep (added in Plan 02 when bollard is updated)

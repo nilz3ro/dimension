@@ -1,0 +1,61 @@
+[package]
+name = "dimension-worker"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dimension-worker"
+path = "src/main.rs"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+hyphae-core = { workspace = true }
+tonic-prost = { workspace = true }
+backon = { workspace = true }
+tokio-util = { workspace = true }
+nix = { workspace = true }
+chrono = { workspace = true }
+dimension-protocol = { path = "../dimension-protocol" }
+
+# Clickhouse invocation records + run events
+clickhouse = { version = "0.14", features = ["uuid"] }
+
+# Pulsar producer for run events
+pulsar = { version = "6", default-features = false, features = ["tokio-runtime", "compression"] }
+
+# Concurrent map for per-run broadcasts
+dashmap = "6"
+
+# Async helpers for envelope reader
+futures = { workspace = true }
+bytes = { workspace = true }
+
+# MinIO log uploads (S3-compatible via opendal, same pattern as gateway)
+opendal = { version = "0.55", features = ["services-s3"] }
+
+# Worker needs the orchestration handler to run VMs
+dimension-gateway = { path = "../dimension-gateway" }
+# Worker needs Postgres stores for platform dispatch (session events, webhooks)
+dimension-store = { path = "../dimension-store" }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }
+bytes = { workspace = true }
+chrono = { workspace = true }
+opendal = { version = "0.55", features = ["services-memory"] }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }

@@ -1,0 +1,39 @@
+/target
+/target_build_script
+**/tests/fixtures/**/Cargo.toml
+**/tests/fixtures/**/Cargo.lock
+**/tests/fixtures/**/target/
+test-agent/target/
+
+# Ansible -- never commit decrypted vault files
+# (vault_vars.yml should only be committed in encrypted form)
+packages/sdk/node_modules/
+tests/e2e/target/
+
+# ── GSD baseline (auto-generated) ──
+.gsd
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+.env
+.env.*
+!.env.example
+node_modules/
+.next/
+dist/
+build/
+__pycache__/
+*.pyc
+.venv/
+venv/
+target/
+vendor/
+*.log
+coverage/
+.cache/
+tmp/

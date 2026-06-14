@@ -1,0 +1,7 @@
+[package]
+name = "hyphae-init"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+libc = { workspace = true }

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dimension Bundle"
+  short_description: "Build Dimension bundles from stdin"
+  default_prompt: "Use $dimension-bundle to create a Dimension bundle whose entrypoint reads the invocation payload from stdin."

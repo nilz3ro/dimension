@@ -1,0 +1,4 @@
+# Default build target for the init binary (Linux guest VM)
+# On non-Linux hosts, build.rs in hyphae-core cross-compiles explicitly.
+# [build]
+# target = "x86_64-unknown-linux-musl"

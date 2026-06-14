@@ -1,0 +1,24 @@
+[capabilities]
+storage = true
+agent_calls = true
+
+[resources]
+memory_mb = 2048
+vcpus = 2
+timeout_secs = 300
+
+[volumes]
+size = "10GB"
+
+[env]
+MINIO_ENDPOINT = "${MINIO_ENDPOINT}"
+MINIO_ACCESS_KEY = "${MINIO_ACCESS_KEY}"
+MINIO_SECRET_KEY = "${MINIO_SECRET_KEY}"
+MINIO_BUCKET = "${MINIO_BUCKET}"
+OPENAI_API_KEY = "${OPENAI_API_KEY}"
+OPENAI_MODEL = "gpt-5.4"
+
+[a2a]
+name = "dimension-coder"
+description = "Coding agent with full filesystem, shell, and web access. Builds, edits, tests, and deploys code inside an isolated Firecracker microVM. Can upload artifacts to persistent storage."
+skills = ["coding", "debugging", "refactoring", "web-search", "artifact-upload"]

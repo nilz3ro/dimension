@@ -1,0 +1,13 @@
+[capabilities]
+storage = true
+agent_calls = false
+
+[resources]
+memory_mb = 2048
+vcpus = 2
+timeout_secs = 300
+
+[a2a]
+name = "ui-builder"
+description = "UI builder agent that recreates interfaces from screenshots. A planner/builder/reviewer graph loop analyzes the input image with a vision model, writes HTML/CSS/JS, screenshots the result with headless Chromium, and iterates until the reviewer approves."
+skills = ["ui-generation", "html-css", "screenshot-comparison", "vision"]

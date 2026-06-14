@@ -1,0 +1,13 @@
+[capabilities]
+storage = false
+agent_calls = false
+
+[resources]
+memory_mb = 512
+vcpus = 1
+timeout_secs = 120
+
+[a2a]
+name = "translator"
+description = "Translation agent powered by TranslateGemma running on a local RTX 3090. Translates text between languages. No tools — pure translation via Ollama."
+skills = ["translation", "language-detection"]

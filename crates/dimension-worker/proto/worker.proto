@@ -1,0 +1,145 @@
+syntax = "proto3";
+package dimension.worker;
+
+service WorkerService {
+    // Note: worker registration happens over HTTP (gateway
+    // POST /internal/workers/register), not gRPC.
+    // Gateway polls workers periodically to check health and available resources.
+    rpc Health(HealthRequest) returns (HealthResponse);
+    // Gateway or operator signals worker to stop accepting new work.
+    rpc Drain(DrainRequest) returns (DrainResponse);
+    // Start a long-running deployment VM. Returns guest_ip and pid on success.
+    rpc StartDeployment(StartDeploymentRequest) returns (StartDeploymentResponse);
+    // Stop a running deployment VM by SIGKILL.
+    rpc StopDeployment(StopDeploymentRequest) returns (StopDeploymentResponse);
+    // Get current status of a deployment from in-memory worker state.
+    rpc GetDeploymentStatus(GetDeploymentStatusRequest) returns (GetDeploymentStatusResponse);
+    // Gateway pushes a bundle ext4 image to the worker for local storage.
+    rpc PushBundle(PushBundleRequest) returns (PushBundleResponse);
+    // Run an invocation in one of three modes: sync, async, persistent.
+    rpc RunInvocation(RunInvocationRequest) returns (RunInvocationResponse);
+    // Stop a persistent or async invocation by ID (kills the VM).
+    rpc StopInvocation(StopInvocationRequest) returns (StopInvocationResponse);
+    // Server-streaming subscribe to live run events for a single run.
+    // Used by the gateway when Pulsar is unavailable; events come from the
+    // worker's in-process broadcast. Replay from earlier sequence numbers
+    // is the caller's responsibility (Clickhouse).
+    rpc SubscribeRunEvents(SubscribeRunEventsRequest) returns (stream RunEventProto);
+}
+
+message PushBundleRequest {
+    string name = 1;           // Bundle name
+    string tag = 2;            // Version tag (e.g. "latest", "v1")
+    string content_hash = 3;   // SHA-256 hash of the ext4 content
+    bytes ext4_data = 4;       // The ext4 rootfs bytes
+    uint64 size_bytes = 5;     // Size of the ext4 data
+    string manifest_json = 6;  // Serialized DimensionManifest from dimension.toml (empty if none)
+}
+
+message PushBundleResponse {
+    bool success = 1;
+    int64 bundle_id = 2;       // Local registry image ID
+    string error = 3;          // Set on failure
+}
+
+// Health poll: gateway -> worker.
+message HealthRequest {}
+
+message HealthResponse {
+    WorkerResources available = 1;
+    int32 running_vms = 2;
+    bool draining = 3;
+}
+
+// Shared resource descriptor.
+message WorkerResources {
+    uint64 memory_mb = 1;
+    uint32 vcpus = 2;
+}
+
+// Drain signals the worker to stop accepting new work.
+message DrainRequest {}
+
+message DrainResponse {
+    bool draining = 1;
+}
+
+message StartDeploymentRequest {
+    string deployment_id = 1;   // UUID string
+    string bundle_id = 2;
+    string user_id = 3;         // UUID string (for Vault/secrets scoping)
+    uint32 probe_port = 4;      // Port the deployment VM listens on for health probes
+}
+
+message StartDeploymentResponse {
+    bool success = 1;
+    string guest_ip = 2;        // Set on success
+    uint32 pid = 3;             // Firecracker PID on success
+    string error = 4;           // Set on failure
+}
+
+message StopDeploymentRequest {
+    string deployment_id = 1;
+}
+
+message StopDeploymentResponse {
+    bool success = 1;
+    string error = 2;
+}
+
+message GetDeploymentStatusRequest {
+    string deployment_id = 1;
+}
+
+message GetDeploymentStatusResponse {
+    string status = 1;      // "running", "stopped", "not_found"
+    uint32 pid = 2;         // 0 if not running
+    string guest_ip = 3;    // Empty if not running
+}
+
+// ── Run invocation messages ───────────────────────────────────────────────
+
+message RunInvocationRequest {
+    string bundle_id = 1;      // Bundle name or ID to run
+    string mode = 2;           // "sync", "async", "persistent"
+    bytes payload = 3;         // JSON payload passed to the VM via MMDS
+    uint32 vsock_port = 4;     // Host-side vsock port for stdout capture (sync mode)
+    uint32 timeout_secs = 5;   // Per-invocation timeout (0 = use server default)
+    string user_id = 6;        // UUID of the authenticated user dispatching this invocation
+}
+
+message RunInvocationResponse {
+    bool success = 1;
+    string invocation_id = 2;  // UUID of the invocation
+    bytes stdout = 3;          // Captured stdout (sync mode only)
+    int32 exit_code = 4;       // Process exit code (sync mode only; 0 if async/persistent)
+    string error = 5;          // Set on failure
+}
+
+message StopInvocationRequest {
+    string invocation_id = 1;  // UUID of the invocation to stop
+}
+
+message StopInvocationResponse {
+    bool success = 1;
+    string error = 2;          // Set on failure
+}
+
+// ── Run event streaming (outbound message center fallback path) ────────────
+
+message SubscribeRunEventsRequest {
+    string run_id = 1;     // UUID of the run to subscribe to
+}
+
+message RunEventProto {
+    string run_id = 1;
+    uint64 seq = 2;
+    int64 ts_ms = 3;
+    string kind = 4;
+    string content_type = 5;
+    bytes body = 6;
+    map<string, string> attrs = 7;
+    string worker_id = 8;
+    string bundle_id = 9;
+    string user_id = 10;
+}

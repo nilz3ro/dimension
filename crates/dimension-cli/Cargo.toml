@@ -1,0 +1,30 @@
+[package]
+name = "dimension-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "dimension"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+tokio-util = { workspace = true }
+comfy-table = { workspace = true }
+indicatif = { workspace = true }
+dirs = { workspace = true }
+hyphae-core = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+bytesize = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]

@@ -1,0 +1,14 @@
+[package]
+name = "hyphae"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hyphae-core = { workspace = true }
+hyphae-errors = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+nix = { workspace = true }
