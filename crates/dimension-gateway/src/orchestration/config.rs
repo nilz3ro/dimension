@@ -11,6 +11,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
+use hyphae_core::jail::{JailConfig, validate_jail_user};
+use hyphae_core::launch::LaunchMode;
+use hyphae_errors::JailError;
+
 // ---------------------------------------------------------------------------
 // OrchestrationConfig
 // ---------------------------------------------------------------------------
@@ -55,6 +59,9 @@ pub struct OrchestrationConfig {
     /// When `None`, VMs launch in direct mode (no jailer).
     pub jailer_bin: Option<PathBuf>,
 
+    /// When true, refuse to launch VMs without jailer isolation.
+    pub require_jail: bool,
+
     /// Base directory for jailer chroots (default: /srv/jailer).
     /// Only used when `jailer_bin` is set.
     pub chroot_base_dir: PathBuf,
@@ -73,12 +80,46 @@ impl Default for OrchestrationConfig {
             enable_network: false,
             suppress_guest_stderr: true,
             jailer_bin: None,
+            require_jail: false,
             chroot_base_dir: PathBuf::from("/srv/jailer"),
         }
     }
 }
 
 impl OrchestrationConfig {
+    /// Resolve the configured launch mode for a VM.
+    ///
+    /// A configured jailer is always fail-closed: an invalid path or missing
+    /// jail user returns an error instead of falling back to direct mode.
+    pub fn resolve_launch_mode(&self, vm_id: String) -> Result<LaunchMode, JailError> {
+        let Some(jailer_bin) = self.jailer_bin.as_ref() else {
+            if self.require_jail {
+                return Err(JailError::JailerNotFound {
+                    path: PathBuf::from("DIMENSION_JAILER_BIN"),
+                });
+            }
+            return Ok(LaunchMode::Direct);
+        };
+
+        if !jailer_bin.is_file() {
+            return Err(JailError::JailerNotFound {
+                path: jailer_bin.clone(),
+            });
+        }
+
+        let jail_user = validate_jail_user()?;
+        let mut jail_config = JailConfig::new(
+            jailer_bin.clone(),
+            self.firecracker_bin.clone(),
+            vm_id,
+            jail_user.uid,
+            jail_user.gid,
+        );
+        jail_config.chroot_base_dir = self.chroot_base_dir.clone();
+
+        Ok(LaunchMode::Jailed(jail_config))
+    }
+
     /// Resolve the boot timeout for a request.
     ///
     /// If the request provides an override, it is clamped to the server
@@ -175,6 +216,27 @@ mod tests {
         assert_eq!(config.processing_timeout, Duration::from_secs(300));
         assert_eq!(config.max_boot_timeout, Duration::from_secs(60));
         assert_eq!(config.max_processing_timeout, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn default_config_uses_direct_launch_mode() {
+        let config = OrchestrationConfig::default();
+        assert!(matches!(
+            config.resolve_launch_mode("test-vm".to_string()),
+            Ok(LaunchMode::Direct)
+        ));
+    }
+
+    #[test]
+    fn required_jail_without_binary_fails_closed() {
+        let config = OrchestrationConfig {
+            require_jail: true,
+            ..OrchestrationConfig::default()
+        };
+        assert!(matches!(
+            config.resolve_launch_mode("test-vm".to_string()),
+            Err(JailError::JailerNotFound { .. })
+        ));
     }
 
     #[test]

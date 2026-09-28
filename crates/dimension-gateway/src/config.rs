@@ -178,6 +178,7 @@ impl AppConfig {
             // Future: expose as CLI flag if needed.
             suppress_guest_stderr: true,
             jailer_bin: None,
+            require_jail: false,
             chroot_base_dir: PathBuf::from("/srv/jailer"),
         }
     }

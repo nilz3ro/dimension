@@ -41,6 +41,18 @@ pub struct WorkerConfig {
     #[arg(long, default_value = "firecracker", env = "DIMENSION_FIRECRACKER_BIN")]
     pub firecracker_bin: std::path::PathBuf,
 
+    /// Path to the Firecracker jailer binary.
+    #[arg(long, env = "DIMENSION_JAILER_BIN")]
+    pub jailer_bin: Option<std::path::PathBuf>,
+
+    /// Require all VMs to launch through the Firecracker jailer.
+    #[arg(long, default_value_t = false, env = "DIMENSION_REQUIRE_JAIL")]
+    pub require_jail: bool,
+
+    /// Base directory for jailer chroots.
+    #[arg(long, default_value = "/srv/jailer", env = "DIMENSION_CHROOT_BASE_DIR")]
+    pub chroot_base_dir: std::path::PathBuf,
+
     /// Default boot timeout in seconds.
     #[arg(long, default_value_t = 30, env = "DIMENSION_BOOT_TIMEOUT_SECS")]
     pub boot_timeout_secs: u64,

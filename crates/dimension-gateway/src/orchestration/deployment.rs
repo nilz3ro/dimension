@@ -96,11 +96,17 @@ impl DeploymentVmManager {
         _user_id: Uuid,
         probe_port: u16,
     ) -> anyhow::Result<(String, u32)> {
-        use hyphae_core::launch::{launch, LaunchConfig, LaunchMode, NetworkConfig};
+        use hyphae_core::launch::{launch, LaunchConfig, NetworkConfig};
         use hyphae_core::net::setup_vm_network;
         use hyphae_core::process::runtime::{create_deployment_runtime_dir, runtime_base_dir};
         use hyphae_core::registry::{parse_image_ref, Registry};
         use hyphae_core::config::VsockConfig;
+
+        let vm_id = deployment_id.simple().to_string();
+        let launch_mode = self
+            .orch_config
+            .resolve_launch_mode(vm_id.clone())
+            .map_err(|e| anyhow::anyhow!("jail mode could not be established: {e}"))?;
 
         // Create runtime dir under deployments/ (NOT vms/)
         let base = runtime_base_dir();
@@ -156,11 +162,11 @@ impl DeploymentVmManager {
 
         let vsock_uds_path = runtime_dir.join("v.sock");
         let launch_cfg = LaunchConfig {
-            vm_id: deployment_id.simple().to_string(),
+            vm_id,
             kernel_path: self.orch_config.kernel_path.clone(),
             firecracker_bin: self.orch_config.firecracker_bin.clone(),
             rootfs_path: std::path::PathBuf::from(&image.disk_path),
-            mode: LaunchMode::Direct,
+            mode: launch_mode,
             network,
             vsock: Some(VsockConfig {
                 guest_cid,

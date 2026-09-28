@@ -219,6 +219,16 @@ impl WorkerService for WorkerServiceImpl {
         let user_id = Uuid::parse_str(&req.user_id)
             .map_err(|e| Status::invalid_argument(format!("invalid user_id: {e}")))?;
 
+        if self.orch_config.require_jail {
+            self.orch_config
+                .resolve_launch_mode(deployment_id.simple().to_string())
+                .map_err(|e| {
+                    Status::failed_precondition(format!(
+                        "required jail mode is unavailable: {e}"
+                    ))
+                })?;
+        }
+
         match self
             .deployment_manager
             .start(deployment_id, &req.bundle_id, user_id, req.probe_port as u16)
@@ -407,7 +417,7 @@ impl WorkerService for WorkerServiceImpl {
         request: Request<RunInvocationRequest>,
     ) -> Result<Response<RunInvocationResponse>, Status> {
         use hyphae_core::config::VsockConfig;
-        use hyphae_core::launch::{launch, LaunchConfig, LaunchMode, NetworkConfig};
+        use hyphae_core::launch::{launch, LaunchConfig, NetworkConfig};
         use hyphae_core::net::setup_vm_network;
         use hyphae_core::process::runtime::{create_vm_runtime_dir, runtime_base_dir};
         use hyphae_core::registry::{parse_image_ref, Registry};
@@ -428,6 +438,12 @@ impl WorkerService for WorkerServiceImpl {
         }
 
         let invocation_id = Uuid::new_v4();
+        let launch_mode = self
+            .orch_config
+            .resolve_launch_mode(invocation_id.simple().to_string())
+            .map_err(|e| {
+                Status::failed_precondition(format!("jail mode could not be established: {e}"))
+            })?;
         tracing::info!(
             invocation_id = %invocation_id,
             bundle_id = %req.bundle_id,
@@ -516,7 +532,7 @@ impl WorkerService for WorkerServiceImpl {
             kernel_path: self.orch_config.kernel_path.clone(),
             firecracker_bin: self.orch_config.firecracker_bin.clone(),
             rootfs_path: PathBuf::from(&image.disk_path),
-            mode: LaunchMode::Direct,
+            mode: launch_mode,
             network,
             vsock: Some(VsockConfig {
                 guest_cid,
