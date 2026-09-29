@@ -53,6 +53,45 @@ async fn main() {
     );
 
     // ── 3. Setup registry, config, and allocators ──────────────────────
+    let jailer_bin = if config.require_jail {
+        let jailer_bin = match config.jailer_bin.clone() {
+            Some(path) => path,
+            None => hyphae_core::jail::find_jailer(Some(&config.firecracker_bin)).unwrap_or_else(
+                |e| {
+                    tracing::error!(error = %e, "jailer is required but could not be discovered");
+                    eprintln!("error: jailer is required but could not be discovered: {e}");
+                    eprintln!("hint: set DIMENSION_JAILER_BIN to the jailer binary path");
+                    std::process::exit(1);
+                },
+            ),
+        };
+
+        if !jailer_bin.is_file() {
+            tracing::error!(path = %jailer_bin.display(), "configured jailer binary is not a file");
+            eprintln!(
+                "error: configured jailer binary is not a file: {}",
+                jailer_bin.display()
+            );
+            eprintln!("hint: set DIMENSION_JAILER_BIN to the jailer binary path");
+            std::process::exit(1);
+        }
+
+        let jail_user = hyphae_core::jail::validate_jail_user().unwrap_or_else(|e| {
+            tracing::error!(error = %e, "jailer is required but the jail user is invalid");
+            eprintln!("error: jailer is required but the jail user is invalid: {e}");
+            std::process::exit(1);
+        });
+        info!(
+            path = %jailer_bin.display(),
+            uid = jail_user.uid,
+            gid = jail_user.gid,
+            "required jailer configuration validated"
+        );
+        Some(jailer_bin)
+    } else {
+        config.jailer_bin.clone()
+    };
+
     let registry_path = config.resolved_registry_path();
     // Verify the registry is accessible at startup.
     let _registry = hyphae_core::registry::Registry::open(&registry_path).unwrap_or_else(|e| {
@@ -73,8 +112,9 @@ async fn main() {
         mock: false,
         enable_network: config.enable_network,
         suppress_guest_stderr: true,
-        jailer_bin: None,
-        chroot_base_dir: std::path::PathBuf::from("/srv/jailer"),
+        jailer_bin,
+        require_jail: config.require_jail,
+        chroot_base_dir: config.chroot_base_dir.clone(),
     };
 
     // ── 4. Create DeploymentVmManager (worker mode — no DeploymentStore) ──

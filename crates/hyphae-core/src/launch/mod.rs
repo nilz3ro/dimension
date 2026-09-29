@@ -114,6 +114,8 @@ pub struct LaunchResult {
     pub log_file: Option<String>,
     /// Path to the Firecracker API socket (for post-launch operations).
     pub api_socket_path: Option<PathBuf>,
+    /// Actual host-side path where the vsock Unix socket will exist.
+    pub vsock_host_path: Option<PathBuf>,
 }
 
 /// Launch a Firecracker VM using the unified launch API.

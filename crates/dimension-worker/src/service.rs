@@ -11,6 +11,8 @@
 //! - **async**: launch VM, return immediately, VM runs until done.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicI32, Ordering},
     Arc,
@@ -24,8 +26,6 @@ use uuid::Uuid;
 use dimension_gateway::orchestration::config::{CidAllocator, OrchestrationConfig};
 use hyphae_core::net::SubnetAllocator;
 use dimension_gateway::orchestration::deployment::DeploymentVmManager;
-
-use std::path::PathBuf;
 
 use crate::events::{EventSink, RunBroadcast, RunEvent, StateEmitter};
 use crate::observability::{ClickhouseClient, InvocationRecord, InvocationStatus, LogUploader, now_epoch_ms};
@@ -56,6 +56,10 @@ pub struct InvocationState {
     pub pid: u32,
     /// Runtime directory for this invocation's VM.
     pub runtime_dir: PathBuf,
+    /// VM identifier used for cgroup cleanup.
+    pub vm_id: String,
+    /// Jail root directory (only set for jailed launches).
+    pub jail_root: Option<PathBuf>,
     /// Guest CID allocated for vsock.
     pub guest_cid: u32,
     /// User who dispatched the invocation.
@@ -64,6 +68,61 @@ pub struct InvocationState {
     pub started_at: std::time::Instant,
     /// Epoch-millis timestamp for Clickhouse created_at.
     pub created_at_ms: i64,
+}
+
+fn resolve_vsock_host_path(reported_path: Option<&Path>, fallback_path: &Path) -> PathBuf {
+    reported_path.unwrap_or(fallback_path).to_path_buf()
+}
+
+async fn teardown_vm(pid: u32, vm_id: &str, jail_root: Option<&Path>, runtime_dir: &Path) {
+    use nix::sys::signal::{self, Signal};
+    use nix::unistd::Pid;
+
+    match i32::try_from(pid) {
+        Ok(raw_pid) => {
+            if let Err(e) = signal::kill(Pid::from_raw(raw_pid), Signal::SIGKILL) {
+                tracing::warn!(pid, vm_id, error = %e, "worker: SIGKILL failed during teardown");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(pid, vm_id, error = %e, "worker: invalid PID during teardown");
+        }
+    }
+
+    if let Err(e) = hyphae_core::jail::remove_cgroup(vm_id) {
+        tracing::warn!(vm_id, error = %e, "worker: failed to remove cgroup during teardown");
+    }
+
+    if let Some(jail_root) = jail_root {
+        // `jail_root` is `{chroot_base}/{exec}/{vm_id}/root`, but the jailer
+        // also writes state (e.g. the pid file) next to `root/`. Remove the
+        // whole per-VM jail directory, matching hyphae's cleanup_jail().
+        let vm_dir = jail_root
+            .parent()
+            .filter(|p| p.file_name().map(|n| n == OsStr::new(vm_id)).unwrap_or(false));
+        let jail_target = vm_dir.unwrap_or(jail_root);
+        if let Err(e) = tokio::fs::remove_dir_all(jail_target).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    vm_id,
+                    path = %jail_target.display(),
+                    error = %e,
+                    "worker: failed to remove jail directory during teardown"
+                );
+            }
+        }
+    }
+
+    if let Err(e) = tokio::fs::remove_dir_all(runtime_dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                vm_id,
+                path = %runtime_dir.display(),
+                error = %e,
+                "worker: failed to remove runtime directory during teardown"
+            );
+        }
+    }
 }
 
 /// gRPC WorkerService implementation that delegates VM execution to the
@@ -218,6 +277,16 @@ impl WorkerService for WorkerServiceImpl {
             .map_err(|e| Status::invalid_argument(format!("invalid deployment_id: {e}")))?;
         let user_id = Uuid::parse_str(&req.user_id)
             .map_err(|e| Status::invalid_argument(format!("invalid user_id: {e}")))?;
+
+        if self.orch_config.require_jail {
+            self.orch_config
+                .resolve_launch_mode(deployment_id.simple().to_string())
+                .map_err(|e| {
+                    Status::failed_precondition(format!(
+                        "required jail mode is unavailable: {e}"
+                    ))
+                })?;
+        }
 
         match self
             .deployment_manager
@@ -407,7 +476,7 @@ impl WorkerService for WorkerServiceImpl {
         request: Request<RunInvocationRequest>,
     ) -> Result<Response<RunInvocationResponse>, Status> {
         use hyphae_core::config::VsockConfig;
-        use hyphae_core::launch::{launch, LaunchConfig, LaunchMode, NetworkConfig};
+        use hyphae_core::launch::{launch, LaunchConfig, NetworkConfig};
         use hyphae_core::net::setup_vm_network;
         use hyphae_core::process::runtime::{create_vm_runtime_dir, runtime_base_dir};
         use hyphae_core::registry::{parse_image_ref, Registry};
@@ -428,6 +497,12 @@ impl WorkerService for WorkerServiceImpl {
         }
 
         let invocation_id = Uuid::new_v4();
+        let launch_mode = self
+            .orch_config
+            .resolve_launch_mode(invocation_id.simple().to_string())
+            .map_err(|e| {
+                Status::failed_precondition(format!("jail mode could not be established: {e}"))
+            })?;
         tracing::info!(
             invocation_id = %invocation_id,
             bundle_id = %req.bundle_id,
@@ -516,7 +591,7 @@ impl WorkerService for WorkerServiceImpl {
             kernel_path: self.orch_config.kernel_path.clone(),
             firecracker_bin: self.orch_config.firecracker_bin.clone(),
             rootfs_path: PathBuf::from(&image.disk_path),
-            mode: LaunchMode::Direct,
+            mode: launch_mode,
             network,
             vsock: Some(VsockConfig {
                 guest_cid,
@@ -541,6 +616,12 @@ impl WorkerService for WorkerServiceImpl {
         })?;
 
         let pid = result.pid;
+        let vm_id = result.vm_id.clone();
+        let jail_root = result.jail_root.clone();
+        let vsock_host_path = resolve_vsock_host_path(
+            result.vsock_host_path.as_deref(),
+            &vsock_uds_path,
+        );
         let launch_log_file = result.log_file.clone();
         tracing::info!(
             invocation_id = %invocation_id,
@@ -553,11 +634,20 @@ impl WorkerService for WorkerServiceImpl {
         // We connect and send a length-delimited protobuf Request envelope
         // containing the invocation payload. The agent spawns the entrypoint
         // and bridges IPC.
-        let vsock_stream = Self::send_vsock_payload(&vsock_uds_path, &invocation_id, &invocation_payload).await
-            .map_err(|e| {
+        let vsock_stream = match Self::send_vsock_payload(
+            &vsock_host_path,
+            &invocation_id,
+            &invocation_payload,
+        )
+        .await
+        {
+            Ok(stream) => stream,
+            Err(e) => {
                 tracing::error!(invocation_id = %invocation_id, error = %e, "vsock payload send failed");
-                Status::internal(format!("vsock payload send failed: {e}"))
-            })?;
+                teardown_vm(pid, &vm_id, jail_root.as_deref(), &runtime_dir).await;
+                return Err(Status::internal(format!("vsock payload send failed: {e}")));
+            }
+        };
         // Keep the vsock stream alive — dropping it closes the connection
         // before the agent can read the payload.
 
@@ -572,6 +662,8 @@ impl WorkerService for WorkerServiceImpl {
             mode: req.mode.clone(),
             pid,
             runtime_dir: runtime_dir.clone(),
+            vm_id: vm_id.clone(),
+            jail_root: jail_root.clone(),
             guest_cid,
             user_id: user_id.clone(),
             started_at: start_instant,
@@ -697,7 +789,7 @@ impl WorkerService for WorkerServiceImpl {
                 // Clean up: remove from invocations, decrement running VMs.
                 self.invocations.write().await.remove(&invocation_id);
                 self.running_vms.fetch_sub(1, Ordering::Relaxed);
-                let _ = tokio::fs::remove_dir_all(&runtime_dir).await;
+                teardown_vm(pid, &vm_id, jail_root.as_deref(), &runtime_dir).await;
 
                 state_emitter.emit(
                     "state",
@@ -834,7 +926,7 @@ impl WorkerService for WorkerServiceImpl {
                     // Clean up.
                     invocations.write().await.remove(&invocation_id);
                     running_vms.fetch_sub(1, Ordering::Relaxed);
-                    let _ = tokio::fs::remove_dir_all(&runtime_dir).await;
+                    teardown_vm(pid, &vm_id, jail_root.as_deref(), &runtime_dir).await;
 
                     state_emitter_clone.emit(
                         "state",
@@ -915,20 +1007,6 @@ impl WorkerService for WorkerServiceImpl {
 
         match state {
             Some(state) => {
-                // SIGKILL the Firecracker process.
-                use nix::sys::signal::{self, Signal};
-                use nix::unistd::Pid;
-
-                let pid = Pid::from_raw(state.pid as i32);
-                if let Err(e) = signal::kill(pid, Signal::SIGKILL) {
-                    tracing::warn!(
-                        invocation_id = %invocation_id,
-                        pid = state.pid,
-                        error = %e,
-                        "worker: SIGKILL failed (process may have already exited)"
-                    );
-                }
-
                 // ── Observability: record stopped invocation ────────────
                 let duration_ms = state.started_at.elapsed().as_millis() as u64;
                 let log_url = LogUploader::log_url(&self.log_minio_bucket, &invocation_id);
@@ -959,8 +1037,13 @@ impl WorkerService for WorkerServiceImpl {
                     });
                 }
 
-                // Clean up runtime directory.
-                let _ = tokio::fs::remove_dir_all(&state.runtime_dir).await;
+                teardown_vm(
+                    state.pid,
+                    &state.vm_id,
+                    state.jail_root.as_deref(),
+                    &state.runtime_dir,
+                )
+                .await;
                 self.running_vms.fetch_sub(1, Ordering::Relaxed);
 
                 tracing::info!(
@@ -1171,5 +1254,52 @@ impl WorkerServiceImpl {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_vsock_host_path_prefers_reported_path_and_falls_back() {
+        let reported = Path::new("/jail/root/v.sock");
+        let fallback = Path::new("/runtime/v.sock");
+
+        assert_eq!(
+            resolve_vsock_host_path(Some(reported), fallback),
+            reported
+        );
+        assert_eq!(resolve_vsock_host_path(None, fallback), fallback);
+    }
+
+    #[tokio::test]
+    async fn teardown_vm_removes_jail_and_runtime_directories() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let vm_id = format!("test-{}", Uuid::new_v4());
+        // Mirror the real jail layout: {base}/{exec}/{vm_id}/root.
+        let vm_dir = temp.path().join("firecracker").join(&vm_id);
+        let jail_root = vm_dir.join("root");
+        let runtime_dir = temp.path().join("runtime");
+        std::fs::create_dir_all(&jail_root).expect("create jail directory");
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime directory");
+        std::fs::write(jail_root.join("v.sock"), b"sock").expect("write jail artifact");
+        std::fs::write(vm_dir.join("firecracker.pid"), b"42\n").expect("write pid file");
+        std::fs::write(runtime_dir.join("artifact"), b"runtime")
+            .expect("write runtime artifact");
+
+        teardown_vm(u32::MAX, &vm_id, Some(&jail_root), &runtime_dir).await;
+
+        assert!(!vm_dir.exists(), "whole per-VM jail directory must be removed");
+        assert!(!jail_root.exists());
+        assert!(!runtime_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn teardown_vm_accepts_missing_paths_and_no_jail() {
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let runtime_dir = temp.path().join("missing-runtime");
+
+        teardown_vm(u32::MAX, &format!("test-{}", Uuid::new_v4()), None, &runtime_dir).await;
     }
 }

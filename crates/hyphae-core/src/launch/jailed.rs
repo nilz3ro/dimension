@@ -4,7 +4,7 @@
 //! limits, and privilege dropping. Resources (kernel, rootfs, config) are
 //! hard-linked into the jail directory before launch.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -27,6 +27,27 @@ const DEFAULT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1";
 
 /// API socket filename inside the jail (relative to jail root).
 const JAIL_API_SOCK: &str = "run/firecracker.socket";
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct JailedVsockPaths {
+    /// Path written to the Firecracker config, relative to the chroot.
+    pub config_path: PathBuf,
+    /// Path used by host processes to connect to the socket.
+    pub host_path: PathBuf,
+}
+
+pub(crate) fn jailed_vsock_paths(jail_root: &Path, uds_path: &Path) -> JailedVsockPaths {
+    let config_path = uds_path
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let host_path = jail_root.join(&config_path);
+
+    JailedVsockPaths {
+        config_path,
+        host_path,
+    }
+}
 
 /// Launch Firecracker through the jailer with full isolation.
 ///
@@ -118,16 +139,20 @@ async fn launch_jailed_inner(
     // IMPORTANT: In jailed mode, Firecracker runs inside a chroot.
     // The UDS path must be jail-relative (filename only), not host-absolute.
     // The host-side vsock proxy uses the absolute path; Firecracker uses the relative one.
-    if let Some(ref vsock_cfg) = config.vsock {
-        // Remove any stale UDS file — Firecracker needs to create this socket
-        // itself and will fail with EADDRINUSE if the file already exists.
-        let _ = std::fs::remove_file(&vsock_cfg.uds_path);
-        let jail_relative_uds = std::path::Path::new(&vsock_cfg.uds_path)
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        vm_config = vm_config.with_vsock(vsock_cfg.guest_cid, jail_relative_uds.as_ref());
-    }
+    let vsock_host_path = if let Some(ref vsock_cfg) = config.vsock {
+        let paths = jailed_vsock_paths(&jail_root, Path::new(&vsock_cfg.uds_path));
+        // Remove any stale UDS file from the host-visible jail location —
+        // Firecracker needs to create this socket itself and will fail with
+        // EADDRINUSE if the file already exists.
+        let _ = std::fs::remove_file(&paths.host_path);
+        vm_config = vm_config.with_vsock(
+            vsock_cfg.guest_cid,
+            paths.config_path.to_string_lossy().as_ref(),
+        );
+        Some(paths.host_path)
+    } else {
+        None
+    };
 
     // Append any extra boot arguments.
     if let Some(ref extra) = config.extra_boot_args {
@@ -319,6 +344,7 @@ async fn launch_jailed_inner(
         jailed: true,
         log_file: Some(log_file_path.to_string_lossy().to_string()),
         api_socket_path: Some(api_socket_path),
+        vsock_host_path,
     })
 }
 
@@ -340,5 +366,21 @@ fn cleanup_on_failure(vm_id: &str, jail_config: &JailConfig) {
             error = %e,
             "failed to clean up jail directory during cleanup"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jailed_vsock_paths_use_filename_in_config_and_jail_path_on_host() {
+        let jail_root = Path::new("/srv/jailer/firecracker/vm/root");
+        let configured_path = Path::new("/some/runtime/vm/v.sock");
+
+        let paths = jailed_vsock_paths(jail_root, configured_path);
+
+        assert_eq!(paths.config_path, PathBuf::from("v.sock"));
+        assert_eq!(paths.host_path, jail_root.join("v.sock"));
     }
 }
