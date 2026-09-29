@@ -8,6 +8,8 @@
 //! DO NOT use VmLifecycleGuard for deployment VMs — its Drop impl sends SIGKILL.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -24,7 +26,66 @@ pub struct RunningDeployment {
     pub pid: u32,
     pub guest_ip: String,
     pub probe_port: u16,
-    pub runtime_dir: std::path::PathBuf,
+    pub runtime_dir: PathBuf,
+    pub vm_id: String,
+    pub jail_root: Option<PathBuf>,
+}
+
+async fn teardown_deployment(
+    pid: Option<u32>,
+    vm_id: &str,
+    jail_root: Option<&Path>,
+    runtime_dir: &Path,
+) {
+    use nix::sys::signal::{self, Signal};
+    use nix::unistd::Pid;
+
+    if let Some(pid) = pid {
+        match i32::try_from(pid) {
+            Ok(raw_pid) => {
+                if let Err(e) = signal::kill(Pid::from_raw(raw_pid), Signal::SIGKILL) {
+                    tracing::warn!(pid, vm_id, error = %e, "deployment SIGKILL failed during teardown");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(pid, vm_id, error = %e, "deployment has invalid PID during teardown");
+            }
+        }
+    }
+
+    if let Err(e) = hyphae_core::jail::remove_cgroup(vm_id) {
+        tracing::warn!(vm_id, error = %e, "failed to remove deployment cgroup during teardown");
+    }
+
+    if let Some(jail_root) = jail_root {
+        // `jail_root` is `{chroot_base}/{exec}/{vm_id}/root`; the jailer also
+        // writes state next to `root/`. Remove the whole per-VM jail dir.
+        let vm_dir = jail_root
+            .parent()
+            .filter(|p| p.file_name().map(|n| n == OsStr::new(vm_id)).unwrap_or(false));
+        let jail_target = vm_dir.unwrap_or(jail_root);
+        if let Err(e) = tokio::fs::remove_dir_all(jail_target).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    vm_id,
+                    path = %jail_target.display(),
+                    error = %e,
+                    "failed to remove deployment jail directory during teardown"
+                );
+            }
+        }
+    }
+
+    if let Err(e) = tokio::fs::remove_dir_all(runtime_dir).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                vm_id,
+                path = %runtime_dir.display(),
+                error = %e,
+                "failed to remove deployment runtime directory during teardown"
+            );
+        }
+    }
 }
 
 /// Manages the lifecycle of long-running deployment VMs.
@@ -107,6 +168,10 @@ impl DeploymentVmManager {
             .orch_config
             .resolve_launch_mode(vm_id.clone())
             .map_err(|e| anyhow::anyhow!("jail mode could not be established: {e}"))?;
+        let configured_jail_root = match &launch_mode {
+            hyphae_core::launch::LaunchMode::Jailed(config) => Some(config.jail_root()),
+            hyphae_core::launch::LaunchMode::Direct => None,
+        };
 
         // Create runtime dir under deployments/ (NOT vms/)
         let base = runtime_base_dir();
@@ -162,7 +227,7 @@ impl DeploymentVmManager {
 
         let vsock_uds_path = runtime_dir.join("v.sock");
         let launch_cfg = LaunchConfig {
-            vm_id,
+            vm_id: vm_id.clone(),
             kernel_path: self.orch_config.kernel_path.clone(),
             firecracker_bin: self.orch_config.firecracker_bin.clone(),
             rootfs_path: std::path::PathBuf::from(&image.disk_path),
@@ -180,8 +245,19 @@ impl DeploymentVmManager {
             mmds_payload: None,
         };
 
-        let result = launch(launch_cfg).await
-            .map_err(|e| anyhow::anyhow!("launch failed: {e}"))?;
+        let result = match launch(launch_cfg).await {
+            Ok(result) => result,
+            Err(e) => {
+                teardown_deployment(
+                    None,
+                    &vm_id,
+                    configured_jail_root.as_deref(),
+                    &runtime_dir,
+                )
+                .await;
+                return Err(anyhow::anyhow!("launch failed: {e}"));
+            }
+        };
 
         let pid = result.pid;
 
@@ -192,6 +268,8 @@ impl DeploymentVmManager {
             guest_ip: guest_ip.clone(),
             probe_port,
             runtime_dir,
+            vm_id: result.vm_id,
+            jail_root: result.jail_root,
         };
         self.running.write().await.insert(deployment_id, state);
 
@@ -200,11 +278,8 @@ impl DeploymentVmManager {
 
     /// Stop a deployment VM by SIGKILL and cleanup.
     ///
-    /// Sends SIGKILL to the PID, cancels vsock proxy, removes runtime dir.
+    /// Sends SIGKILL to the PID and removes cgroup, jail, and runtime state.
     pub async fn stop(&self, deployment_id: Uuid) -> anyhow::Result<()> {
-        use nix::sys::signal::{self, Signal};
-        use nix::unistd::Pid;
-
         let state = self
             .running
             .write()
@@ -212,12 +287,13 @@ impl DeploymentVmManager {
             .remove(&deployment_id)
             .ok_or_else(|| anyhow::anyhow!("deployment {} not found in running map", deployment_id))?;
 
-        // SIGKILL the Firecracker process
-        let pid = Pid::from_raw(state.pid as i32);
-        let _ = signal::kill(pid, Signal::SIGKILL);
-
-        // Clean up runtime directory
-        let _ = std::fs::remove_dir_all(&state.runtime_dir);
+        teardown_deployment(
+            Some(state.pid),
+            &state.vm_id,
+            state.jail_root.as_deref(),
+            &state.runtime_dir,
+        )
+        .await;
 
         Ok(())
     }

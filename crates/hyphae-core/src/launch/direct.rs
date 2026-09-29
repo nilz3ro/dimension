@@ -4,7 +4,7 @@
 //! for development and testing; production deployments should use the
 //! jailed path for sandbox isolation.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use hyphae_errors::HyphaeError;
 use tracing::info;
@@ -18,6 +18,10 @@ use super::{LaunchConfig, LaunchResult};
 /// Default boot arguments for the guest kernel.
 const DEFAULT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1";
 
+pub(crate) fn direct_vsock_host_path(uds_path: &Path) -> PathBuf {
+    uds_path.to_path_buf()
+}
+
 /// Launch Firecracker directly without the jailer.
 ///
 /// Builds a VmConfig from the LaunchConfig parameters, writes it to a
@@ -26,6 +30,11 @@ const DEFAULT_BOOT_ARGS: &str = "console=ttyS0 reboot=k panic=1";
 ///
 /// Uses ABSOLUTE paths in the Firecracker config (no chroot).
 pub async fn launch_direct(config: LaunchConfig) -> Result<LaunchResult, HyphaeError> {
+    let vsock_host_path = config
+        .vsock
+        .as_ref()
+        .map(|vsock| direct_vsock_host_path(Path::new(&vsock.uds_path)));
+
     // Build VmConfig with absolute paths.
     let mut vm_config = VmConfig::new(
         config.kernel_path.to_string_lossy().as_ref(),
@@ -149,5 +158,18 @@ pub async fn launch_direct(config: LaunchConfig) -> Result<LaunchResult, HyphaeE
         jailed: false,
         log_file,
         api_socket_path: Some(api_socket_path),
+        vsock_host_path,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_vsock_host_path_preserves_configured_absolute_path() {
+        let configured_path = Path::new("/some/runtime/vm/v.sock");
+
+        assert_eq!(direct_vsock_host_path(configured_path), configured_path);
+    }
 }
