@@ -74,6 +74,17 @@ fn resolve_vsock_host_path(reported_path: Option<&Path>, fallback_path: &Path) -
     reported_path.unwrap_or(fallback_path).to_path_buf()
 }
 
+fn invocation_outcome(
+    done: Option<&dimension_protocol::proto::Done>,
+    _process_exit_code: i32,
+) -> (InvocationStatus, i32) {
+    match done {
+        Some(done) if done.success => (InvocationStatus::Completed, done.exit_code),
+        Some(done) => (InvocationStatus::Failed, done.exit_code),
+        None => (InvocationStatus::Failed, -1),
+    }
+}
+
 async fn teardown_vm(pid: u32, vm_id: &str, jail_root: Option<&Path>, runtime_dir: &Path) {
     use nix::sys::signal::{self, Signal};
     use nix::unistd::Pid;
@@ -716,34 +727,42 @@ impl WorkerService for WorkerServiceImpl {
                     &self.event_sink,
                 );
 
-                let stdout_bytes = match tokio::time::timeout(timeout, read_fut).await {
-                    Ok(buf) => buf,
+                let (stdout_bytes, done) = match tokio::time::timeout(timeout, read_fut).await {
+                    Ok(result) => result,
                     Err(_) => {
                         tracing::warn!(
                             invocation_id = %invocation_id,
                             "worker: envelope stream read timed out"
                         );
-                        Vec::new()
+                        (Vec::new(), None)
                     }
                 };
 
                 // Wait for the process to exit (best-effort, short timeout).
-                let exit_code = Self::wait_for_process_exit(pid, std::time::Duration::from_secs(5)).await;
+                let process_exit_code = Self::wait_for_process_exit(
+                    pid,
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
 
                 state_emitter.emit(
                     "state",
                     serde_json::json!({
                         "phase": "process_exited",
-                        "exit_code": exit_code,
+                        "exit_code": process_exit_code,
                     }),
                 );
 
                 // ── Observability: fire-and-forget CH insert + MinIO upload ──
                 let duration_ms = start_instant.elapsed().as_millis() as u64;
-                let status = if exit_code == 0 {
-                    InvocationStatus::Completed
+                let (status, exit_code) = invocation_outcome(done.as_ref(), process_exit_code);
+                let success = status == InvocationStatus::Completed;
+                let error = if success {
+                    String::new()
+                } else if done.is_some() {
+                    format!("guest exited with code {exit_code}")
                 } else {
-                    InvocationStatus::Failed
+                    "agent stream closed without Done".to_string()
                 };
                 let log_url = LogUploader::log_url(&self.log_minio_bucket, &invocation_id);
                 let record = InvocationRecord {
@@ -796,6 +815,7 @@ impl WorkerService for WorkerServiceImpl {
                     serde_json::json!({
                         "phase": "completed",
                         "status": status.to_string(),
+                        "exit_code": exit_code,
                         "duration_ms": duration_ms,
                     }),
                 );
@@ -816,11 +836,11 @@ impl WorkerService for WorkerServiceImpl {
                 );
 
                 Ok(Response::new(RunInvocationResponse {
-                    success: true,
+                    success,
                     invocation_id: invocation_id.to_string(),
                     stdout: stdout_bytes,
                     exit_code,
-                    error: String::new(),
+                    error,
                 }))
             }
             "async" => {
@@ -848,7 +868,7 @@ impl WorkerService for WorkerServiceImpl {
 
                     // Drain the envelope stream in the background. Returns
                     // when the agent sends Done or the stream closes.
-                    let _stdout = Self::read_envelope_stream(
+                    let (_stdout, done) = Self::read_envelope_stream(
                         vsock_stream,
                         invocation_id,
                         &worker_id,
@@ -859,22 +879,23 @@ impl WorkerService for WorkerServiceImpl {
                     .await;
 
                     // Poll until the process exits.
-                    let exit_code = Self::wait_for_process_exit(pid, std::time::Duration::from_secs(3600)).await;
+                    let process_exit_code = Self::wait_for_process_exit(
+                        pid,
+                        std::time::Duration::from_secs(3600),
+                    )
+                    .await;
                     state_emitter_clone.emit(
                         "state",
                         serde_json::json!({
                             "phase": "process_exited",
-                            "exit_code": exit_code,
+                            "exit_code": process_exit_code,
                         }),
                     );
                     let duration_ms = start_instant.elapsed().as_millis() as u64;
 
                     // ── Observability ────────────────────────────────────
-                    let status = if exit_code == 0 {
-                        InvocationStatus::Completed
-                    } else {
-                        InvocationStatus::Failed
-                    };
+                    let (status, exit_code) =
+                        invocation_outcome(done.as_ref(), process_exit_code);
                     let log_url = LogUploader::log_url(&bucket, &invocation_id);
                     let record = InvocationRecord {
                         invocation_id,
@@ -933,6 +954,7 @@ impl WorkerService for WorkerServiceImpl {
                         serde_json::json!({
                             "phase": "completed",
                             "status": record.status,
+                            "exit_code": exit_code,
                             "duration_ms": duration_ms,
                         }),
                     );
@@ -1077,8 +1099,8 @@ impl WorkerServiceImpl {
     /// Decode framed `OutboundMessage` envelopes from the vsock stream until
     /// a `Done` envelope is received or the stream closes. Each message is
     /// converted into a `RunEvent` and pushed to the EventSink. The
-    /// concatenated body bytes of any `stdout-final` messages are returned
-    /// (this is what the sync RPC response surfaces to the client).
+    /// concatenated body bytes of any `stdout-final` messages and the received
+    /// `Done` payload are returned (stdout is surfaced by the sync RPC).
     async fn read_envelope_stream(
         stream: tokio::net::UnixStream,
         invocation_id: Uuid,
@@ -1086,7 +1108,7 @@ impl WorkerServiceImpl {
         bundle_id: &str,
         user_id: &str,
         sink: &EventSink,
-    ) -> Vec<u8> {
+    ) -> (Vec<u8>, Option<dimension_protocol::proto::Done>) {
         use dimension_protocol::proto::envelope;
         use dimension_protocol::ProtocolCodec;
         use futures::StreamExt;
@@ -1094,6 +1116,7 @@ impl WorkerServiceImpl {
 
         let mut framed = FramedRead::new(stream, ProtocolCodec::default());
         let mut stdout_buf = Vec::new();
+        let mut done = None;
         while let Some(frame) = framed.next().await {
             match frame {
                 Ok(env) => match env.payload {
@@ -1112,7 +1135,10 @@ impl WorkerServiceImpl {
                             stdout_buf.extend_from_slice(&body);
                         }
                     }
-                    Some(envelope::Payload::Done(_)) => break,
+                    Some(envelope::Payload::Done(payload)) => {
+                        done = Some(payload);
+                        break;
+                    }
                     Some(envelope::Payload::Error(err)) => {
                         tracing::warn!(
                             invocation_id = %invocation_id,
@@ -1133,7 +1159,7 @@ impl WorkerServiceImpl {
                 }
             }
         }
-        stdout_buf
+        (stdout_buf, done)
     }
 
     /// Send the invocation payload to the dimension-agent over vsock.
@@ -1271,6 +1297,84 @@ mod tests {
             reported
         );
         assert_eq!(resolve_vsock_host_path(None, fallback), fallback);
+    }
+
+    #[test]
+    fn invocation_outcome_uses_guest_done_status() {
+        use dimension_protocol::proto::Done;
+
+        let completed = Done {
+            metadata: Default::default(),
+            exit_code: 0,
+            success: true,
+        };
+        let failed = Done {
+            metadata: Default::default(),
+            exit_code: 3,
+            success: false,
+        };
+        let inconsistent = Done {
+            metadata: Default::default(),
+            exit_code: 0,
+            success: false,
+        };
+
+        assert_eq!(
+            invocation_outcome(Some(&completed), 9),
+            (InvocationStatus::Completed, 0)
+        );
+        assert_eq!(
+            invocation_outcome(Some(&failed), 0),
+            (InvocationStatus::Failed, 3)
+        );
+        assert_eq!(
+            invocation_outcome(Some(&inconsistent), 0),
+            (InvocationStatus::Failed, 0)
+        );
+        assert_eq!(
+            invocation_outcome(None, 0),
+            (InvocationStatus::Failed, -1)
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_stream_returns_done_payload() {
+        use dimension_protocol::proto::{envelope, Done, Envelope};
+        use dimension_protocol::ProtocolCodec;
+        use tokio::io::AsyncWriteExt;
+        use tokio_util::bytes::BytesMut;
+        use tokio_util::codec::Encoder;
+
+        let (reader, mut writer) = tokio::net::UnixStream::pair().expect("create stream pair");
+        let expected = Done {
+            metadata: Default::default(),
+            exit_code: 7,
+            success: false,
+        };
+        let envelope = Envelope {
+            request_id: "request-id".to_string(),
+            payload: Some(envelope::Payload::Done(expected.clone())),
+        };
+        let mut encoded = BytesMut::new();
+        ProtocolCodec::default()
+            .encode(envelope, &mut encoded)
+            .expect("encode Done envelope");
+        writer.write_all(&encoded).await.expect("write envelope");
+        writer.shutdown().await.expect("close writer");
+
+        let fanout = crate::events::EventFanout::spawn(None, None);
+        let (stdout, done) = WorkerServiceImpl::read_envelope_stream(
+            reader,
+            Uuid::new_v4(),
+            "worker",
+            "bundle",
+            "user",
+            &fanout.sink,
+        )
+        .await;
+
+        assert!(stdout.is_empty());
+        assert_eq!(done, Some(expected));
     }
 
     #[tokio::test]

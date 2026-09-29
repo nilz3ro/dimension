@@ -5,7 +5,7 @@ use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::{Bytes, BytesMut};
@@ -17,6 +17,8 @@ use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::Encoder;
+
+use crate::entrypoint::{entrypoint_argv, exit_outcome, parse_args_json};
 
 const EVENTS_SOCK_PATH: &str = "/run/dimension/events.sock";
 const EVENTS_SOCK_ENV: &str = "DIMENSION_EVENTS_SOCK";
@@ -44,6 +46,14 @@ async fn run_async() -> Result<(), String> {
 
     let binary = std::env::var("DIMENSION_AGENT_BINARY")
         .map_err(|_| "DIMENSION_AGENT_BINARY not set".to_string())?;
+    let args_json = match std::env::var("DIMENSION_AGENT_ARGS_JSON") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err("DIMENSION_AGENT_ARGS_JSON is not valid UTF-8".to_string());
+        }
+    };
+    let args = parse_args_json(args_json.as_deref())?;
 
     eprintln!("dimension-agent: listening on vsock port {port}");
 
@@ -84,22 +94,28 @@ async fn run_async() -> Result<(), String> {
     // ----- Fan-in channel for OutboundMessages
     let (tx, rx) = mpsc::channel::<OutboundMessage>(256);
     let sequence = Arc::new(AtomicU64::new(0));
+    let child_outcome = Arc::new(OnceLock::new());
 
     // ----- Vsock writer: blocking thread that drains the channel.
     let writer_handle = std::thread::Builder::new()
         .name("dimension-agent-vsock-writer".to_string())
         .spawn({
             let request_id = request_id.clone();
-            move || vsock_writer(std_conn, request_id, rx)
+            let child_outcome = child_outcome.clone();
+            move || vsock_writer(std_conn, request_id, rx, child_outcome)
         })
         .map_err(|e| format!("spawn vsock writer thread: {e}"))?;
 
     // ----- Spawn the child
-    let mut child = Command::new(&binary)
+    let argv = entrypoint_argv(&binary, &args);
+    let mut child = Command::new(&argv[0]);
+    child
+        .args(&argv[1..])
         .env(EVENTS_SOCK_ENV, EVENTS_SOCK_PATH)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = child
         .spawn()
         .map_err(|e| format!("spawn {binary}: {e}"))?;
 
@@ -125,6 +141,7 @@ async fn run_async() -> Result<(), String> {
     let uds_task = tokio::spawn(uds_accept_loop(uds, tx.clone(), sequence.clone()));
 
     let exit_status = child.wait().await.map_err(|e| format!("child wait: {e}"))?;
+    let (exit_code, success) = exit_outcome(&exit_status);
     eprintln!("dimension-agent: entrypoint exited with {exit_status}");
 
     let _ = stdout_task.await;
@@ -134,7 +151,11 @@ async fn run_async() -> Result<(), String> {
     uds_task.abort();
     let _ = std::fs::remove_file(EVENTS_SOCK_PATH);
 
-    // Close the channel; writer thread sees the close and sends Done.
+    // Publish the outcome before closing the channel. The writer observes the
+    // channel close after this write and includes the outcome in Done.
+    child_outcome
+        .set((exit_code, success))
+        .map_err(|_| "entrypoint exit outcome was already set".to_string())?;
     drop(tx);
     let _ = tokio::task::spawn_blocking(move || writer_handle.join()).await;
 
@@ -237,6 +258,7 @@ fn vsock_writer(
     mut conn: std::fs::File,
     request_id: String,
     mut rx: mpsc::Receiver<OutboundMessage>,
+    exit_outcome: Arc<OnceLock<(i32, bool)>>,
 ) {
     let mut codec = ProtocolCodec::default();
     let mut buf = BytesMut::new();
@@ -258,9 +280,14 @@ fn vsock_writer(
     }
 
     buf.clear();
+    let (exit_code, success) = exit_outcome.get().copied().unwrap_or((-1, false));
     let done = Envelope {
         request_id,
-        payload: Some(envelope::Payload::Done(Done::default())),
+        payload: Some(envelope::Payload::Done(Done {
+            metadata: Default::default(),
+            exit_code,
+            success,
+        })),
     };
     if let Err(e) = codec.encode(done, &mut buf) {
         eprintln!("dimension-agent: encode done: {e}");

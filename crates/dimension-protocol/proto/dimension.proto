@@ -54,6 +54,8 @@ message Error {
 message Done {
   // Optional summary metadata
   map<string, string> metadata = 1;
+  int32 exit_code = 2;
+  bool success = 3;
 }
 
 // Guest -> Host: outbound message produced during a run.

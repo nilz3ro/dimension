@@ -28,6 +28,7 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod agent;
+mod entrypoint;
 
 #[cfg(target_os = "linux")]
 fn main() {

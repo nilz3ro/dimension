@@ -29,6 +29,42 @@ const PLATFORM_PROXY_PORT: u32 = 8765;
 const VMADDR_CID_HOST: u32 = 2;
 
 
+/// Parse the null-separated entrypoint file into its binary and arguments.
+///
+/// Empty arguments are preserved. A single final empty part is ignored when
+/// the file ends with a NUL terminator.
+fn parse_entrypoint(entrypoint: &[u8]) -> Result<(String, Vec<String>), String> {
+    let mut parts: Vec<&[u8]> = entrypoint.split(|&byte| byte == 0).collect();
+    if entrypoint.ends_with(&[0]) {
+        parts.pop();
+    }
+
+    let Some(binary) = parts.first() else {
+        return Err("entrypoint file is empty".to_string());
+    };
+    if binary.is_empty() {
+        return Err("entrypoint file is empty".to_string());
+    }
+
+    let binary = std::str::from_utf8(binary)
+        .map_err(|e| format!("entrypoint binary is not valid UTF-8: {e}"))?
+        .to_string();
+    let args = parts[1..]
+        .iter()
+        .map(|arg| {
+            std::str::from_utf8(arg)
+                .map(str::to_string)
+                .map_err(|e| format!("entrypoint argument is not valid UTF-8: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((binary, args))
+}
+
+/// Serialize entrypoint arguments for transport in an environment variable.
+fn serialize_args_json(args: &[String]) -> Result<String, serde_json::Error> {
+    serde_json::to_string(args)
+}
 
 /// Testable core logic: returns `true` if the cmdline string contains the token
 /// `hyphae.volume=true` as a whitespace-delimited token.
@@ -398,18 +434,13 @@ fn main() {
         }
     };
 
-    let parts: Vec<&[u8]> = entrypoint.split(|&b| b == 0).collect();
-    if parts.is_empty() || parts[0].is_empty() {
-        eprintln!("hyphae-init: entrypoint file is empty");
-        reboot();
-    }
-
-    let cmd = String::from_utf8_lossy(parts[0]);
-    let args: Vec<String> = parts[1..]
-        .iter()
-        .filter(|p| !p.is_empty())
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .collect();
+    let (cmd, args) = match parse_entrypoint(&entrypoint) {
+        Ok(entrypoint) => entrypoint,
+        Err(e) => {
+            eprintln!("hyphae-init: {e}");
+            reboot();
+        }
+    };
 
     // If dimension-agent is present, use it — it handles vsock communication
     // with the worker and spawns the entrypoint. Otherwise run the entrypoint
@@ -420,10 +451,17 @@ fn main() {
         start_platform_bridge();
 
         eprintln!("hyphae-init: starting dimension-agent");
+        let args_json = match serialize_args_json(&args) {
+            Ok(json) => json,
+            Err(e) => {
+                eprintln!("hyphae-init: failed to serialize entrypoint arguments: {e}");
+                reboot();
+            }
+        };
         let mut agent_cmd = std::process::Command::new(DIMENSION_AGENT_PATH);
         agent_cmd
             .env("DIMENSION_AGENT_PORT", DIMENSION_VSOCK_PORT)
-            .env("DIMENSION_AGENT_BINARY", cmd.as_ref());
+            .env("DIMENSION_AGENT_BINARY", &cmd);
 
         // Pass build-time env vars from /etc/hyphae/env
         if let Ok(env_data) = std::fs::read_to_string("/etc/hyphae/env") {
@@ -438,6 +476,8 @@ fn main() {
         for (key, value) in read_runtime_env_from_cmdline() {
             agent_cmd.env(key, value);
         }
+
+        agent_cmd.env("DIMENSION_AGENT_ARGS_JSON", args_json);
 
         if volume_mounted {
             agent_cmd.env("DIMENSION_WORKSPACE", "/workspace");
@@ -462,7 +502,7 @@ fn main() {
         // No agent — run the entrypoint directly.
         eprintln!("hyphae-init: starting {cmd} {}", args.join(" "));
 
-        let mut child_cmd = std::process::Command::new(cmd.as_ref());
+        let mut child_cmd = std::process::Command::new(&cmd);
         child_cmd.args(&args)
             .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
@@ -605,6 +645,31 @@ mod tests {
     fn volume_flag_false_not_matched() {
         // Only the exact token "hyphae.volume=true" matches; "false" must not.
         assert!(!super::volume_flag_from_cmdline_str("hyphae.volume=false"));
+    }
+
+    #[test]
+    fn entrypoint_args_survive_parsing_and_json_roundtrip() {
+        let input = "node\0/app/runner with spaces.mjs\0\0こんにちは\0--flag=value";
+        let (binary, args) = super::parse_entrypoint(input.as_bytes()).expect("parse entrypoint");
+
+        assert_eq!(binary, "node");
+        assert_eq!(
+            args,
+            vec!["/app/runner with spaces.mjs", "", "こんにちは", "--flag=value"]
+        );
+
+        let json = super::serialize_args_json(&args).expect("serialize args");
+        let decoded: Vec<String> = serde_json::from_str(&json).expect("decode args JSON");
+        assert_eq!(decoded, args);
+    }
+
+    #[test]
+    fn entrypoint_parser_ignores_one_trailing_nul_terminator() {
+        let (binary, args) = super::parse_entrypoint(b"/bin/echo\0hello\0")
+            .expect("parse entrypoint");
+
+        assert_eq!(binary, "/bin/echo");
+        assert_eq!(args, vec!["hello"]);
     }
 
 }

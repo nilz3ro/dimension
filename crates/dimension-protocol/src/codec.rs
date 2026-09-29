@@ -165,10 +165,19 @@ mod tests {
     }
 
     /// Helper: create an Envelope with a Done payload.
-    fn done_envelope(request_id: &str, metadata: HashMap<String, String>) -> Envelope {
+    fn done_envelope(
+        request_id: &str,
+        metadata: HashMap<String, String>,
+        exit_code: i32,
+        success: bool,
+    ) -> Envelope {
         Envelope {
             request_id: request_id.to_string(),
-            payload: Some(envelope::Payload::Done(Done { metadata })),
+            payload: Some(envelope::Payload::Done(Done {
+                metadata,
+                exit_code,
+                success,
+            })),
         }
     }
 
@@ -277,13 +286,15 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("tokens".to_string(), "1234".to_string());
         metadata.insert("model".to_string(), "gpt-4".to_string());
-        let original = done_envelope("req-006", metadata.clone());
+        let original = done_envelope("req-006", metadata.clone(), 3, false);
         let mut buf = encode_to_buf(&mut codec, &original);
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(original, decoded);
 
         if let Some(envelope::Payload::Done(done)) = decoded.payload {
             assert_eq!(done.metadata, metadata);
+            assert_eq!(done.exit_code, 3);
+            assert!(!done.success);
         } else {
             panic!("expected Done payload");
         }
@@ -292,7 +303,7 @@ mod tests {
     #[test]
     fn roundtrip_done_empty_metadata() {
         let mut codec = ProtocolCodec::default();
-        let original = done_envelope("req-007", HashMap::new());
+        let original = done_envelope("req-007", HashMap::new(), 0, true);
         let mut buf = encode_to_buf(&mut codec, &original);
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(original, decoded);
