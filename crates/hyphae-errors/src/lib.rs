@@ -343,7 +343,7 @@ pub enum NetworkError {
     MacAddressOverflow { index: u32 },
 }
 
-/// Errors from jailer subsystem (E811-E820).
+/// Errors from jailer subsystem (E811-E821).
 #[derive(Error, Debug)]
 pub enum JailError {
     #[error("[E811] jailer binary not found at {path}")]
@@ -382,6 +382,13 @@ pub enum JailError {
 
     #[error("[E820] invalid PID in {path}: {content}")]
     InvalidPidFile { path: PathBuf, content: String },
+
+    #[error("[E821] failed to stage writable resource {src} -> {dst}: {reason}")]
+    StageFailed {
+        src: PathBuf,
+        dst: PathBuf,
+        reason: String,
+    },
 }
 
 /// Top-level error type wrapping all subsystem errors.

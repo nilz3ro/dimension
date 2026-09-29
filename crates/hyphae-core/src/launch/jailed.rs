@@ -1,8 +1,10 @@
 //! Jailed launch path for Firecracker VMs.
 //!
 //! Invokes the Firecracker jailer with chroot isolation, cgroup resource
-//! limits, and privilege dropping. Resources (kernel, rootfs, config) are
-//! hard-linked into the jail directory before launch.
+//! limits, and privilege dropping. Resources are staged into the jail
+//! directory before launch: kernel and config are hard-linked (read-only),
+//! while writable disks (rootfs, workspace volume) are invocation-private
+//! clones owned by the jail user.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::config::{DriveConfig, VmConfig};
 use crate::jail::cgroup::CgroupConfig;
 use crate::jail::{
-    create_cgroup, create_jail_directory, link_resources_into_jail, remove_cgroup,
+    create_cgroup, create_jail_directory, stage_resources_into_jail, remove_cgroup,
     validate_jail_user, wait_for_pid_file, JailConfig,
 };
 use crate::mmds;
@@ -56,7 +58,9 @@ pub(crate) fn jailed_vsock_paths(jail_root: &Path, uds_path: &Path) -> JailedVso
 /// 2. Create a cgroup with CPU/memory limits
 /// 3. Build VmConfig with relative paths (inside chroot)
 /// 4. Write config to a temporary file
-/// 5. Create jail directory and hard-link resources
+/// 5. Create jail directory and stage resources (read-only links for
+///    kernel/config; invocation-private jail-user-owned clones for writable
+///    disks)
 /// 6. Build and spawn the jailer command
 /// 7. Wait for Firecracker to write its PID file
 /// 8. Return LaunchResult
@@ -161,8 +165,8 @@ async fn launch_jailed_inner(
 
     // Wire in volume drive if present (Phase 17 populates LaunchConfig.volume_drive).
     // In jailed mode, the drive path must be relative (just the filename) because
-    // Firecracker runs inside a chroot. The actual file will be hard-linked into
-    // the jail root in Step 5.
+    // Firecracker runs inside a chroot. The actual file will be staged as an
+    // invocation-private clone in the jail root in Step 5.
     let volume_filename_owned: Option<String> = config.volume_drive.as_ref().map(|p| {
         p.file_name()
             .unwrap_or_default()
@@ -200,42 +204,23 @@ async fn launch_jailed_inner(
         }
     })?;
 
-    // Step 5: Create jail directory and hard-link resources.
+    // Step 5: Create the jail directory and stage resources.
+    //
+    // Kernel and config are hard-linked (read-only for the guest). The
+    // rootfs and any workspace volume are writable disks: each launch gets
+    // an invocation-private clone (reflink or copy) owned by the jail
+    // UID/GID, so jailed Firecracker can open them read/write without ever
+    // exposing the shared source images to guest mutations.
     create_jail_directory(&jail_root)?;
-    link_resources_into_jail(
+    stage_resources_into_jail(
         &jail_root,
         &config.kernel_path,
         &config.rootfs_path,
         Some(&config_tmp_path),
+        config.volume_drive.as_deref(),
+        jail_config.uid,
+        jail_config.gid,
     )?;
-
-    // Hard-link the volume image into the jail root (after jail directory exists).
-    // The filename reference in VmConfig was already set above (relative path).
-    if let Some(ref volume_path) = config.volume_drive {
-        let volume_filename = volume_path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
-        let volume_dst = jail_root.join(volume_filename.as_ref());
-        let link_result = std::fs::hard_link(volume_path, &volume_dst);
-        if let Err(e) = link_result {
-            if e.kind() == std::io::ErrorKind::CrossesDevices || e.raw_os_error() == Some(18) {
-                // Cross-device: fall back to copy (slower, but correctness over speed)
-                std::fs::copy(volume_path, &volume_dst).map_err(|ce| {
-                    JailError::DirectoryCreation {
-                        path: volume_dst.clone(),
-                        reason: format!("failed to copy volume image into jail: {ce}"),
-                    }
-                })?;
-            } else {
-                return Err(JailError::DirectoryCreation {
-                    path: volume_dst.clone(),
-                    reason: format!("failed to hard-link volume image into jail: {e}"),
-                }
-                .into());
-            }
-        }
-    }
 
     // Create the `run/` subdirectory for the API socket inside the jail.
     let run_dir = jail_root.join("run");

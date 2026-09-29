@@ -10,7 +10,9 @@ pub mod setup;
 pub mod user;
 
 pub use cgroup::{CgroupConfig, create_cgroup, remove_cgroup};
-pub use setup::{cleanup_jail, create_jail_directory, jail_root_dir, link_resources_into_jail};
+pub use setup::{
+    cleanup_jail, create_jail_directory, jail_root_dir, stage_resources_into_jail,
+};
 pub use user::{JailUser, validate_jail_user};
 
 use std::path::{Path, PathBuf};
