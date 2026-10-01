@@ -1,6 +1,6 @@
 # Buzz chat agent
 
-Tool-free, stateless Buzz chat on the unchanged `@dimension-agents/shared`
+Tool-free Buzz chat on the unchanged `@dimension-agents/shared`
 `runAgent` harness. The launcher accepts either payload:
 
 ```json
@@ -11,7 +11,15 @@ Tool-free, stateless Buzz chat on the unchanged `@dimension-agents/shared`
 {"session_id":"dimension-session","content":[{"type":"text","text":"Hello"}]}
 ```
 
-It sets `CONVERSATION_ID` from `session_id`, discards caller-supplied history,
+An optional `history` array carries the prior session turns, oldest first:
+
+```json
+{"session_id":"buzz-thread","message_text":"What was the code word?","history":[{"role":"user","content":"the code word is bluebird","timestamp":"2026-10-01T10:00:00Z"},{"role":"assistant","content":"noted","timestamp":"2026-10-01T10:00:05Z"}]}
+```
+
+The bridge owns bounding and persistence of that history; the bundle only
+validates it (user/assistant text turns, at most 200 entries) and forwards it
+to the model. It sets `CONVERSATION_ID` from `session_id`,
 and pipes normalized Dimension input into the harness. A successful turn writes
 only final assistant text to stdout, consumed by Dimension as `stdout-final`.
 Errors go to stderr with nonzero exit status; empty, truncated, tool-request,
@@ -47,7 +55,9 @@ The Dockerfile-specific ignore file excludes host dependencies and build output.
 The image skips Puppeteer's browser download; the shared package's tools are
 not passed to the agent. Tests exercise the actual launcher and shared harness
 against a local mock endpoint for both payload shapes, including failure paths
-and absence of credentials on the wire. They do not prove SATHQ reachability,
+and absence of credentials on the wire. History forwarding is covered too:
+the mock endpoint sees the validated history messages ahead of the new user
+turn. They do not prove SATHQ reachability,
 Firecracker networking, bundle upload, or a live Buzz reply.
 
 For the live milestone, Phiveman builds/uploads/deploys the reviewed commit and

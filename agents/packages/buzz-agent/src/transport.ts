@@ -20,12 +20,14 @@ export const chatCompletion: StreamFunction = (model, context, options) => {
             const messages: { role: string; content: string }[] = [];
             if (context.systemPrompt) messages.push({ role: "system", content: context.systemPrompt });
             for (const message of context.messages) {
-                if (message.role !== "user") throw new Error("buzz-agent accepts only a stateless user turn");
+                if (message.role !== "user" && message.role !== "assistant") {
+                    throw new Error("buzz-agent accepts only user and assistant messages");
+                }
                 const content = typeof message.content === "string" ? message.content : message.content.map(block => {
                     if (block.type !== "text") throw new Error("buzz-agent accepts only text");
                     return block.text;
                 }).join("\n");
-                messages.push({ role: "user", content });
+                messages.push({ role: message.role, content });
             }
             const response = await fetch(`${model.baseUrl}/chat/completions`, {
                 method: "POST",

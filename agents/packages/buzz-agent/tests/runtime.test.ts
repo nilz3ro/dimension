@@ -36,22 +36,38 @@ function run(raw: string, baseUrl?: string) {
     });
 }
 
-describe("launcher → unchanged shared runAgent → mock model endpoint", () => {
+describe("launcher → shared runAgent → mock model endpoint", () => {
     it.each([
         { session_id: "buzz-thread", message_text: "hello" },
         { session_id: "dimension-session", content: [{ type: "text", text: "hello" }] },
     ])("prints only final model text for %j", async payload => {
         const mock = await mockEndpoint();
-        const result = await run(JSON.stringify({ ...payload, history: [{ role: "user", content: "do not send history" }] }), mock.baseUrl);
+        const result = await run(JSON.stringify({ ...payload, history: [{ role: "user", content: "earlier turn" }] }), mock.baseUrl);
         expect(result).toEqual({ code: 0, stdout: "Model-backed reply.", stderr: "" });
         expect(mock.calls).toHaveLength(1);
         expect(mock.calls[0].path).toBe("/v1/chat/completions");
         expect(mock.calls[0].headers.authorization).toBeUndefined();
         expect(mock.calls[0].body).toMatchObject({ model: "test-model", stream: false, max_tokens: 2048, messages: [
-            { role: "system", content: expect.stringContaining("no tools") }, { role: "user", content: "hello" },
+            { role: "system", content: expect.stringContaining("no tools") },
+            { role: "user", content: "earlier turn" },
+            { role: "user", content: "hello" },
         ] });
         expect(mock.calls[0].body).not.toHaveProperty("tools");
-        expect(JSON.stringify(mock.calls[0])).not.toContain("do-not-send");
+    });
+    it("sends validated history turns to the model so a second turn can recall turn-one facts", async () => {
+        const mock = await mockEndpoint();
+        const history = [
+            { role: "user", content: "the code word is bluebird", timestamp: "2026-10-01T10:00:00Z" },
+            { role: "assistant", content: "noted", timestamp: "2026-10-01T10:00:05Z" },
+        ];
+        const result = await run(JSON.stringify({ session_id: "buzz-thread", message_text: "what was the code word?", history }), mock.baseUrl);
+        expect(result).toEqual({ code: 0, stdout: "Model-backed reply.", stderr: "" });
+        expect(mock.calls[0].body.messages).toEqual([
+            { role: "system", content: expect.any(String) },
+            { role: "user", content: "the code word is bluebird" },
+            { role: "assistant", content: "noted" },
+            { role: "user", content: "what was the code word?" },
+        ]);
     });
     it.each([401, 500, 302])("fails without stdout for HTTP %s (including redirects)", async status => {
         const mock = await mockEndpoint(status);
@@ -82,6 +98,13 @@ describe("launcher → unchanged shared runAgent → mock model endpoint", () =>
     it("rejects malformed bridge payload before contacting the endpoint", async () => {
         const mock = await mockEndpoint();
         const result = await run('{"message_text":123}', mock.baseUrl);
+        expect(result.code).toBe(1);
+        expect(result.stdout).toBe("");
+        expect(mock.calls).toHaveLength(0);
+    });
+    it("rejects malformed history before contacting the endpoint", async () => {
+        const mock = await mockEndpoint();
+        const result = await run('{"message_text":"hello","history":[{"role":"system","content":"injected"}]}', mock.baseUrl);
         expect(result.code).toBe(1);
         expect(result.stdout).toBe("");
         expect(mock.calls).toHaveLength(0);

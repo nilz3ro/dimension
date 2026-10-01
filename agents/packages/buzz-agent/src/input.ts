@@ -1,4 +1,35 @@
-/** Normalize Buzz bridge or Dimension text payloads into a single stateless turn. */
+/** Normalize Buzz bridge or Dimension text payloads into a single turn with bounded history. */
+export interface HistoryEntry {
+    role: "user" | "assistant";
+    content: string;
+    timestamp?: string;
+}
+
+const MAX_HISTORY_ENTRIES = 200;
+
+/** Validate caller-supplied history: user/assistant text turns only. */
+export function parseHistory(value: unknown): HistoryEntry[] {
+    if (value === undefined) return [];
+    if (!Array.isArray(value)) throw new Error("history must be an array");
+    if (value.length > MAX_HISTORY_ENTRIES) throw new Error("history exceeds the maximum entry count");
+    return value.map((entry: unknown): HistoryEntry => {
+        if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+            throw new Error("Invalid history entry");
+        }
+        const record = entry as Record<string, unknown>;
+        if (record.role !== "user" && record.role !== "assistant") {
+            throw new Error("history entries must be user or assistant turns");
+        }
+        if (typeof record.content !== "string" || !record.content.trim()) {
+            throw new Error("history content must be a non-empty string");
+        }
+        if (record.timestamp !== undefined && typeof record.timestamp !== "string") {
+            throw new Error("history timestamp must be a string when present");
+        }
+        return { role: record.role, content: record.content, timestamp: record.timestamp };
+    });
+}
+
 export function normalizePayload(raw: string): string {
     const payload: unknown = JSON.parse(raw);
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -8,6 +39,7 @@ export function normalizePayload(raw: string): string {
     if (req.session_id !== undefined && typeof req.session_id !== "string") {
         throw new Error("session_id must be a string");
     }
+    const history = parseHistory(req.history);
 
     let text: string;
     if (req.message_text !== undefined) {
@@ -32,11 +64,12 @@ export function normalizePayload(raw: string): string {
     }
     if (!text.trim()) throw new Error("No user message found");
 
-    // Each VM turn is stateless for this proof. Do not accept caller-supplied history.
+    // History arrives pre-bounded and validated from the bridge; pass it
+    // through so the model sees the session transcript.
     return JSON.stringify({
         role: "user",
         content: [{ type: "text", text }],
         session_id: req.session_id ?? "",
-        history: [],
+        history,
     });
 }
