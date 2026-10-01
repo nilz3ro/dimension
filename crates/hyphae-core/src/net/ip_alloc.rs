@@ -72,9 +72,9 @@ impl SubnetAllocator {
 
         self.allocated.insert(index);
 
-        let network = BASE_ADDR + (index * 4);
-        let host_ip = Ipv4Addr::from(network + 1);
-        let guest_ip = Ipv4Addr::from(network + 2);
+        let guest_ip =
+            guest_ip_for_index(index).expect("index was validated against MAX_SUBNETS above");
+        let host_ip = Ipv4Addr::from(u32::from(guest_ip) - 1);
         let mac = generate_mac(index)?;
         let tap_name = format!("hyphae-tap{index}");
 
@@ -96,6 +96,19 @@ impl SubnetAllocator {
     pub fn is_allocated(&self, index: u32) -> bool {
         self.allocated.contains(&index)
     }
+}
+
+/// Derive the guest IP (network + 2) for a /30 allocation index.
+///
+/// Mirrors the address math in [`SubnetAllocator::allocate`] so callers
+/// that only know an orphaned TAP device name (`hyphae-tapN`) can
+/// reconstruct the per-VM rule set. Returns `None` for out-of-range
+/// indices.
+pub fn guest_ip_for_index(index: u32) -> Option<Ipv4Addr> {
+    if index >= MAX_SUBNETS {
+        return None;
+    }
+    Some(Ipv4Addr::from(BASE_ADDR + (index * 4) + 2))
 }
 
 /// Generate a unique MAC address from a TAP index.

@@ -68,6 +68,11 @@ pub struct InvocationState {
     pub started_at: std::time::Instant,
     /// Epoch-millis timestamp for Clickhouse created_at.
     pub created_at_ms: i64,
+    /// Network resources for this invocation (`None` when networking is
+    /// disabled). Retained so `stop_invocation` can release them; sync/async
+    /// completion release through their own handle. Release is idempotent,
+    /// so racing terminal paths cannot double-clean.
+    pub network: Option<Arc<tokio::sync::Mutex<NetworkScope>>>,
 }
 
 fn resolve_vsock_host_path(reported_path: Option<&Path>, fallback_path: &Path) -> PathBuf {
@@ -82,6 +87,170 @@ fn invocation_outcome(
         Some(done) if done.success => (InvocationStatus::Completed, done.exit_code),
         Some(done) => (InvocationStatus::Failed, done.exit_code),
         None => (InvocationStatus::Failed, -1),
+    }
+}
+
+/// Physical release of one VM's network resources.
+///
+/// Trait seam so the invocation lifecycle is unit-testable without root,
+/// iptables, or TAP devices: tests observe releases through a recorder
+/// while production drops the real RAII resources.
+pub(crate) trait NetworkRelease: Send {
+    /// Remove the per-VM NAT rules (first) and delete the TAP device.
+    /// Ordering matters: the rules reference the TAP interface.
+    fn release(self: Box<Self>);
+    /// TAP device name, for logging.
+    fn tap_name(&self) -> &str;
+    /// Subnet allocation index to return to the allocator.
+    fn subnet_index(&self) -> u32;
+}
+
+/// Production release backed by hyphae-core's RAII [`VmNetworkResources`].
+///
+/// `release` simply drops the resources: `VmNetworkResources::drop`
+/// removes the NAT rules BEFORE the TAP device is deleted (correct
+/// ordering — rules reference the interface).
+struct SystemNetworkRelease(hyphae_core::net::VmNetworkResources);
+
+impl NetworkRelease for SystemNetworkRelease {
+    fn release(self: Box<Self>) {
+        drop(self);
+    }
+
+    fn tap_name(&self) -> &str {
+        &self.0.allocation.tap_name
+    }
+
+    fn subnet_index(&self) -> u32 {
+        self.0.allocation.index
+    }
+}
+
+/// Owns one invocation's network resources for its entire lifecycle.
+///
+/// Previously the worker leaked `VmNetworkResources` via
+/// `std::mem::forget` — five completed invocations left five TAP devices
+/// plus their ACCEPT/DROP/MASQUERADE rules on the host. `NetworkScope`
+/// keeps the resources alive while the VM runs and releases them exactly
+/// once on every terminal path:
+///
+/// - [`NetworkScope::teardown`] — the deterministic, awaited release used
+///   by every terminal path (launch failure, vsock-delivery failure, sync
+///   completion, async completion, stop invocation).
+/// - `Drop` — a best-effort safety net for paths that skip `teardown`
+///   (early returns, panics): releases TAP/NAT synchronously and returns
+///   the subnet index via `try_lock`.
+///
+/// Both paths are idempotent — the release handle is taken out, so a
+/// terminal path racing `stop_invocation` cannot double-clean.
+pub(crate) struct NetworkScope {
+    release: Option<Box<dyn NetworkRelease>>,
+    allocator: Arc<tokio::sync::Mutex<SubnetAllocator>>,
+}
+
+impl std::fmt::Debug for NetworkScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkScope")
+            .field("tap", &self.release.as_ref().map(|r| r.tap_name()))
+            .field("released", &self.release.is_none())
+            .finish()
+    }
+}
+
+impl NetworkScope {
+    /// Allocate TAP + subnet + NAT rules for a new invocation.
+    ///
+    /// Returns the [`hyphae_core::launch::NetworkConfig`] for the launch
+    /// request plus the scope (wrapped for sharing between the state map,
+    /// the async monitor task, and `stop_invocation`) that must be
+    /// released on a terminal path.
+    async fn setup(
+        allocator: Arc<tokio::sync::Mutex<SubnetAllocator>>,
+        lan_allow: &[hyphae_core::net::LanAllow],
+    ) -> Result<
+        (
+            hyphae_core::launch::NetworkConfig,
+            Arc<tokio::sync::Mutex<Self>>,
+        ),
+        hyphae_errors::NetworkError,
+    > {
+        let resources = {
+            let mut guard = allocator.lock().await;
+            hyphae_core::net::setup_vm_network(&mut guard, true, lan_allow)?
+        };
+        let net_config = hyphae_core::launch::NetworkConfig {
+            tap_name: resources.allocation.tap_name.clone(),
+            host_ip: resources.allocation.host_ip,
+            guest_ip: resources.allocation.guest_ip,
+            guest_mac: resources.allocation.mac.clone(),
+            enable_nat: false,
+        };
+        let scope = Self {
+            release: Some(Box::new(SystemNetworkRelease(resources))),
+            allocator,
+        };
+        Ok((net_config, Arc::new(tokio::sync::Mutex::new(scope))))
+    }
+
+    /// Test constructor with an injectable release recorder.
+    #[cfg(test)]
+    fn mock(
+        release: Box<dyn NetworkRelease>,
+        allocator: Arc<tokio::sync::Mutex<SubnetAllocator>>,
+    ) -> Arc<tokio::sync::Mutex<Self>> {
+        Arc::new(tokio::sync::Mutex::new(Self {
+            release: Some(release),
+            allocator,
+        }))
+    }
+
+    /// Deterministic terminal release: remove NAT rules + TAP device and
+    /// return the subnet index to the allocator. Idempotent — a second
+    /// call is a no-op.
+    pub(crate) async fn teardown(&mut self) {
+        if let Some(release) = self.release.take() {
+            let tap = release.tap_name().to_owned();
+            let index = release.subnet_index();
+            release.release();
+            self.allocator.lock().await.release(index);
+            tracing::info!(
+                tap = %tap,
+                subnet_index = index,
+                "worker: VM network resources released"
+            );
+        }
+    }
+}
+
+impl Drop for NetworkScope {
+    /// Safety net for paths that skip [`NetworkScope::teardown`]. The
+    /// subnet index is returned best-effort: if the allocator lock is
+    /// contended the index stays reserved (worst case: one fewer /30
+    /// subnet until worker restart) instead of blocking or double-
+    /// releasing in `drop`.
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let tap = release.tap_name().to_owned();
+            let index = release.subnet_index();
+            release.release();
+            match self.allocator.try_lock() {
+                Ok(mut allocator) => allocator.release(index),
+                Err(_) => tracing::warn!(
+                    tap = %tap,
+                    subnet_index = index,
+                    "worker: NetworkScope dropped with allocator busy; \
+                     subnet index stays reserved until worker restart"
+                ),
+            }
+            tracing::info!(tap = %tap, "worker: VM network resources released on drop");
+        }
+    }
+}
+
+/// Release an invocation's network resources (idempotent, exactly once).
+async fn release_network(network: Option<&Arc<tokio::sync::Mutex<NetworkScope>>>) {
+    if let Some(scope) = network {
+        scope.lock().await.teardown().await;
     }
 }
 
@@ -134,6 +303,25 @@ async fn teardown_vm(pid: u32, vm_id: &str, jail_root: Option<&Path>, runtime_di
             );
         }
     }
+}
+
+/// Full resource teardown for a terminal invocation path: kill the VM,
+/// remove the cgroup/jail/runtime directory, then release the TAP/NAT
+/// rules and return the subnet index.
+///
+/// Every terminal path with a live VM process (vsock-delivery failure,
+/// sync completion, async completion, stop invocation) funnels through
+/// this one function. The network release is idempotent, so a terminal
+/// path racing `stop_invocation` cannot double-clean.
+async fn teardown_invocation(
+    pid: u32,
+    vm_id: &str,
+    jail_root: Option<&Path>,
+    runtime_dir: &Path,
+    network: Option<&Arc<tokio::sync::Mutex<NetworkScope>>>,
+) {
+    teardown_vm(pid, vm_id, jail_root, runtime_dir).await;
+    release_network(network).await;
 }
 
 /// gRPC WorkerService implementation that delegates VM execution to the
@@ -487,8 +675,7 @@ impl WorkerService for WorkerServiceImpl {
         request: Request<RunInvocationRequest>,
     ) -> Result<Response<RunInvocationResponse>, Status> {
         use hyphae_core::config::VsockConfig;
-        use hyphae_core::launch::{launch, LaunchConfig, NetworkConfig};
-        use hyphae_core::net::setup_vm_network;
+        use hyphae_core::launch::{launch, LaunchConfig};
         use hyphae_core::process::runtime::{create_vm_runtime_dir, runtime_base_dir};
         use hyphae_core::registry::{parse_image_ref, Registry};
 
@@ -566,21 +753,16 @@ impl WorkerService for WorkerServiceImpl {
         let _ = std::fs::remove_file(&vsock_uds_path);
 
         // Network setup: allocate TAP + subnet when enable_network is true.
-        // Forgetting the VmNetworkResources keeps the TAP device alive while the VM runs;
-        // it is cleaned up when the VM process exits via the drop chain.
+        // The NetworkScope owns the TAP device, NAT rules, and subnet
+        // allocation for this invocation and must be released on every
+        // terminal path (previously leaked via std::mem::forget).
+        let mut network_scope: Option<Arc<tokio::sync::Mutex<NetworkScope>>> = None;
         let network = if self.orch_config.enable_network {
-            let mut allocator = self.subnet_allocator.lock().await;
-            let resources = setup_vm_network(&mut allocator, true, &self.orch_config.lan_allow)
-                .map_err(|e| Status::internal(format!("network setup failed: {e}")))?;
-            let net_config = NetworkConfig {
-                tap_name: resources.allocation.tap_name.clone(),
-                host_ip: resources.allocation.host_ip,
-                guest_ip: resources.allocation.guest_ip,
-                guest_mac: resources.allocation.mac.clone(),
-                enable_nat: false,
-            };
-            // Leak the resources so the TAP device persists for the VM's lifetime.
-            std::mem::forget(resources);
+            let (net_config, scope) =
+                NetworkScope::setup(self.subnet_allocator.clone(), &self.orch_config.lan_allow)
+                    .await
+                    .map_err(|e| Status::internal(format!("network setup failed: {e}")))?;
+            network_scope = Some(scope);
             tracing::info!(
                 invocation_id = %invocation_id,
                 tap = %net_config.tap_name,
@@ -617,14 +799,32 @@ impl WorkerService for WorkerServiceImpl {
         };
 
         // ── Launch the VM ──────────────────────────────────────────────
-        let result = launch(launch_cfg).await.map_err(|e| {
-            tracing::error!(
-                invocation_id = %invocation_id,
-                error = %e,
-                "worker: VM launch failed"
-            );
-            Status::internal(format!("VM launch failed: {e}"))
-        })?;
+        let result = match launch(launch_cfg).await {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!(
+                    invocation_id = %invocation_id,
+                    error = %e,
+                    "worker: VM launch failed"
+                );
+                // The launch module already tore down any jail it created
+                // on failure; the worker still owns the runtime dir and the
+                // network resources. There is no PID yet, so remove the
+                // runtime dir directly and release the network scope.
+                if let Err(e) = tokio::fs::remove_dir_all(&runtime_dir).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            invocation_id = %invocation_id,
+                            path = %runtime_dir.display(),
+                            error = %e,
+                            "worker: failed to remove runtime dir after launch failure"
+                        );
+                    }
+                }
+                release_network(network_scope.as_ref()).await;
+                return Err(Status::internal(format!("VM launch failed: {e}")));
+            }
+        };
 
         let pid = result.pid;
         let vm_id = result.vm_id.clone();
@@ -655,7 +855,14 @@ impl WorkerService for WorkerServiceImpl {
             Ok(stream) => stream,
             Err(e) => {
                 tracing::error!(invocation_id = %invocation_id, error = %e, "vsock payload send failed");
-                teardown_vm(pid, &vm_id, jail_root.as_deref(), &runtime_dir).await;
+                teardown_invocation(
+                    pid,
+                    &vm_id,
+                    jail_root.as_deref(),
+                    &runtime_dir,
+                    network_scope.as_ref(),
+                )
+                .await;
                 return Err(Status::internal(format!("vsock payload send failed: {e}")));
             }
         };
@@ -679,6 +886,7 @@ impl WorkerService for WorkerServiceImpl {
             user_id: user_id.clone(),
             started_at: start_instant,
             created_at_ms,
+            network: network_scope.clone(),
         };
         self.invocations.write().await.insert(invocation_id, state);
         self.running_vms.fetch_add(1, Ordering::Relaxed);
@@ -808,7 +1016,14 @@ impl WorkerService for WorkerServiceImpl {
                 // Clean up: remove from invocations, decrement running VMs.
                 self.invocations.write().await.remove(&invocation_id);
                 self.running_vms.fetch_sub(1, Ordering::Relaxed);
-                teardown_vm(pid, &vm_id, jail_root.as_deref(), &runtime_dir).await;
+                teardown_invocation(
+                    pid,
+                    &vm_id,
+                    jail_root.as_deref(),
+                    &runtime_dir,
+                    network_scope.as_ref(),
+                )
+                .await;
 
                 state_emitter.emit(
                     "state",
@@ -947,7 +1162,14 @@ impl WorkerService for WorkerServiceImpl {
                     // Clean up.
                     invocations.write().await.remove(&invocation_id);
                     running_vms.fetch_sub(1, Ordering::Relaxed);
-                    teardown_vm(pid, &vm_id, jail_root.as_deref(), &runtime_dir).await;
+                    teardown_invocation(
+                        pid,
+                        &vm_id,
+                        jail_root.as_deref(),
+                        &runtime_dir,
+                        network_scope.as_ref(),
+                    )
+                    .await;
 
                     state_emitter_clone.emit(
                         "state",
@@ -1059,11 +1281,12 @@ impl WorkerService for WorkerServiceImpl {
                     });
                 }
 
-                teardown_vm(
+                teardown_invocation(
                     state.pid,
                     &state.vm_id,
                     state.jail_root.as_deref(),
                     &state.runtime_dir,
+                    state.network.as_ref(),
                 )
                 .await;
                 self.running_vms.fetch_sub(1, Ordering::Relaxed);
@@ -1405,5 +1628,130 @@ mod tests {
         let runtime_dir = temp.path().join("missing-runtime");
 
         teardown_vm(u32::MAX, &format!("test-{}", Uuid::new_v4()), None, &runtime_dir).await;
+    }
+
+    // ── Network lifecycle tests ────────────────────────────────────
+
+    /// Records releases; shared with the (consumed) mock so assertions
+    /// survive the Box being dropped.
+    struct MockNetworkRelease {
+        tap: String,
+        index: u32,
+        releases: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl NetworkRelease for MockNetworkRelease {
+        fn release(self: Box<Self>) {
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+        fn tap_name(&self) -> &str {
+            &self.tap
+        }
+        fn subnet_index(&self) -> u32 {
+            self.index
+        }
+    }
+
+    fn mock_allocator() -> Arc<tokio::sync::Mutex<SubnetAllocator>> {
+        Arc::new(tokio::sync::Mutex::new(SubnetAllocator::new()))
+    }
+
+    fn mock_scope(
+        index: u32,
+        allocator: Arc<tokio::sync::Mutex<SubnetAllocator>>,
+    ) -> (
+        Arc<tokio::sync::Mutex<NetworkScope>>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let scope = NetworkScope::mock(
+            Box::new(MockNetworkRelease {
+                tap: format!("hyphae-tap{index}"),
+                index,
+                releases: releases.clone(),
+            }),
+            allocator,
+        );
+        (scope, releases)
+    }
+
+    #[tokio::test]
+    async fn network_teardown_releases_tap_nat_and_subnet_index() {
+        let allocator = mock_allocator();
+        let (scope, releases) = mock_scope(7, allocator.clone());
+
+        scope.lock().await.teardown().await;
+
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(!allocator.lock().await.is_allocated(7));
+    }
+
+    #[tokio::test]
+    async fn network_teardown_is_idempotent_no_double_cleanup() {
+        let allocator = mock_allocator();
+        let (scope, releases) = mock_scope(0, allocator.clone());
+
+        // A terminal path racing stop_invocation: both call teardown.
+        scope.lock().await.teardown().await;
+        scope.lock().await.teardown().await;
+        // And the safety-net Drop runs afterwards when the last handle
+        // goes away — it must find nothing left to release.
+        drop(scope);
+
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(!allocator.lock().await.is_allocated(0));
+    }
+
+    #[tokio::test]
+    async fn network_drop_safety_net_releases_without_explicit_teardown() {
+        // Early returns and panics that skip teardown() still release the
+        // TAP/NAT resources and (best-effort, uncontended here) the index.
+        let allocator = mock_allocator();
+        let (scope, releases) = mock_scope(3, allocator.clone());
+
+        drop(scope);
+
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(!allocator.lock().await.is_allocated(3));
+    }
+
+    #[tokio::test]
+    async fn release_network_handles_none_and_is_idempotent() {
+        // Networking disabled: no-op.
+        release_network(None).await;
+
+        let allocator = mock_allocator();
+        let (scope, releases) = mock_scope(5, allocator.clone());
+        release_network(Some(&scope)).await;
+        release_network(Some(&scope)).await;
+
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(!allocator.lock().await.is_allocated(5));
+    }
+
+    #[tokio::test]
+    async fn teardown_invocation_cleans_dirs_and_releases_network() {
+        // The shared terminal-path helper: vsock-delivery failure, sync
+        // completion, async completion, and stop_invocation all route
+        // through this. Proves the VM teardown AND the network release
+        // happen together, exactly once.
+        let temp = tempfile::tempdir().expect("create temp directory");
+        let vm_id = format!("test-{}", Uuid::new_v4());
+        let runtime_dir = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_dir).expect("create runtime directory");
+
+        let allocator = mock_allocator();
+        let (scope, releases) = mock_scope(2, allocator.clone());
+
+        teardown_invocation(u32::MAX, &vm_id, None, &runtime_dir, Some(&scope)).await;
+
+        assert!(!runtime_dir.exists());
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(!allocator.lock().await.is_allocated(2));
+
+        // A second call (terminal path racing stop) must not double-clean.
+        teardown_invocation(u32::MAX, &vm_id, None, &runtime_dir, Some(&scope)).await;
+
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 }

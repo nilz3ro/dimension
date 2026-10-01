@@ -217,6 +217,23 @@ async fn main() {
         warn!("MinIO log upload credentials not set — invocation log uploads disabled");
     }
 
+    // ── Orphan network reconciliation ──────────────────────────────────
+    // A crashed worker leaks TAP devices and their iptables rules (the
+    // terminal-path cleanup never ran). Recover them BEFORE constructing
+    // the SubnetAllocator — its constructor scans /sys/class/net and would
+    // otherwise permanently reserve the leaked indices.
+    if orch_config.enable_network {
+        let report = hyphae_core::net::recover_orphan_network(&orch_config.lan_allow);
+        if report.taps_found > 0 {
+            info!(
+                taps_found = report.taps_found,
+                taps_deleted = report.taps_deleted,
+                nat_rule_sets_removed = report.nat_rule_sets_removed,
+                "worker: recovered orphaned VM network resources"
+            );
+        }
+    }
+
     // ── 7. Create WorkerServiceImpl ─────────────────────────────────────
     let worker_id = uuid::Uuid::new_v4().to_string();
     let service = Arc::new(WorkerServiceImpl::new(

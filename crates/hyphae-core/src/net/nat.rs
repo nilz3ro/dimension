@@ -354,8 +354,15 @@ impl NatRules {
     /// FORWARD ACCEPT rules specific to this VM. Does NOT remove the shared
     /// conntrack ESTABLISHED/RELATED rule, as other VMs may depend on it.
     pub fn remove(&self) -> Result<(), NetworkError> {
+        self.remove_with(&SystemBackend)
+    }
+
+    /// Backend-injectable core of [`NatRules::remove`], so rule deletion
+    /// (and the orphan-recovery reconstruction built on it) is unit-testable
+    /// without root or iptables.
+    pub(crate) fn remove_with(&self, backend: &dyn IptablesBackend) -> Result<(), NetworkError> {
         // Delete POSTROUTING masquerade rule (ignore if already gone)
-        let _ = run_iptables(&[
+        let _ = backend.run(&[
             "-t",
             "nat",
             "-D",
@@ -368,7 +375,7 @@ impl NatRules {
 
         // Delete scoped allowlist ACCEPT rules (ignore if already gone)
         for entry in &self.allow {
-            let _ = run_iptables(&[
+            let _ = backend.run(&[
                 "-D",
                 "FORWARD",
                 "-i",
@@ -386,7 +393,7 @@ impl NatRules {
 
         // Delete LAN isolation DROP rules (ignore if already gone)
         for cidr in LAN_CIDRS {
-            let _ = run_iptables(&[
+            let _ = backend.run(&[
                 "-D",
                 "FORWARD",
                 "-i",
@@ -399,19 +406,38 @@ impl NatRules {
         }
 
         // Delete FORWARD accept rule (ignore if already gone)
-        let _ = run_iptables(&["-D", "FORWARD", "-i", &self.tap_name, "-j", "ACCEPT"]);
+        let _ = backend.run(&["-D", "FORWARD", "-i", &self.tap_name, "-j", "ACCEPT"]);
 
         trace!(tap = %self.tap_name, "NAT + LAN isolation rules removed");
 
         Ok(())
     }
+
+    /// Reconstruct the rule set for a TAP that already has rules installed,
+    /// without touching iptables.
+    ///
+    /// Used by startup orphan recovery: given an orphaned `hyphae-tapN`
+    /// device, the guest IP is derivable from the index, and the allowlist
+    /// comes from the current worker configuration. [`NatRules::remove`]
+    /// then deletes exactly those per-VM rules (tolerating already-gone
+    /// rules). If the allowlist changed since the orphan's rules were
+    /// added, a stale scoped ACCEPT for the old entry may survive; that
+    /// residue is logged by the recovery caller, not silently ignored.
+    pub(crate) fn reconstruct(tap_name: &str, guest_ip: Ipv4Addr, allow: &[LanAllow]) -> Self {
+        NatRules {
+            tap_name: tap_name.to_owned(),
+            guest_ip,
+            allow: allow.to_vec(),
+        }
+    }
 }
 
 /// Execution backend for iptables commands and the ip_forward sysctl.
 ///
-/// Abstracted so [`NatRules::add`] setup and rollback logic can be unit
-/// tested with a mock instead of requiring root + iptables.
-trait IptablesBackend {
+/// Abstracted so [`NatRules::add`] setup/rollback and [`NatRules::remove`]
+/// deletion logic can be unit tested with a mock instead of requiring
+/// root + iptables, and reused by startup orphan recovery in `net::mod`.
+pub(crate) trait IptablesBackend {
     /// Run an `iptables` command (append/delete) — must fail on nonzero
     /// exit status.
     fn run(&self, args: &[&str]) -> Result<(), NetworkError>;
@@ -810,5 +836,54 @@ mod tests {
         assert!(err.to_string().contains("ip_forward"), "got: {err}");
         // No iptables commands attempted after the sysctl failure.
         assert!(backend.commands().is_empty());
+    }
+
+    #[test]
+    fn remove_deletes_every_per_vm_rule_but_not_conntrack() {
+        let backend = MockBackend::new("1");
+        NatRules::add_with(&backend, TAP, GUEST, &allowlist()).unwrap();
+        backend.commands.borrow_mut().clear();
+
+        let rules = NatRules::reconstruct(TAP, GUEST, &allowlist());
+        rules.remove_with(&backend).unwrap();
+
+        let cmds = backend.commands();
+        let deletes: Vec<&String> = cmds.iter().filter(|c| c.contains("-D ")).collect();
+        // masquerade + scoped ACCEPT + 4 LAN DROPs + FORWARD ACCEPT
+        assert_eq!(deletes.len(), 7, "commands: {cmds:?}");
+        assert!(deletes
+            .iter()
+            .any(|c| c.contains(&format!("-t nat -D POSTROUTING -s {GUEST}/30 -j MASQUERADE"))));
+        assert!(deletes.iter().any(|c| c.contains(
+            &format!("-D FORWARD -i {TAP} -d 192.168.105.168/32 -p tcp --dport 8000 -j ACCEPT")
+        )));
+        for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"] {
+            assert!(deletes
+                .iter()
+                .any(|c| c.contains(&format!("-D FORWARD -i {TAP} -d {cidr} -j DROP"))));
+        }
+        assert!(deletes
+            .iter()
+            .any(|c| c.contains(&format!("-D FORWARD -i {TAP} -j ACCEPT"))));
+        // The shared conntrack rule must never be removed per-VM.
+        assert!(!cmds.iter().any(|c| c.contains("conntrack")), "commands: {cmds:?}");
+
+        // Every per-VM rule the add installed is now gone from the set.
+        assert!(!backend.rule_exists("filter", "FORWARD", &format!("-i {TAP} -j ACCEPT")));
+        assert!(backend
+            .rules
+            .borrow()
+            .iter()
+            .any(|k| k.contains("conntrack")),
+            "shared conntrack rule must survive per-VM removal");
+    }
+
+    #[test]
+    fn remove_tolerates_backend_failures() {
+        // Orphan recovery may hit rules that are already gone; every
+        // delete is best-effort and remove must still return Ok.
+        let backend = MockBackend::new("1").fail_on("FORWARD");
+        let rules = NatRules::reconstruct(TAP, GUEST, &allowlist());
+        rules.remove_with(&backend).unwrap();
     }
 }

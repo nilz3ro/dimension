@@ -1033,6 +1033,7 @@ dependencies = [
  "dimension-store",
  "futures",
  "hyphae-core",
+ "hyphae-errors",
  "nix",
  "opendal",
  "prost 0.14.3",
