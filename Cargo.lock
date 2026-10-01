@@ -1792,6 +1792,7 @@ dependencies = [
 name = "hyphae-init"
 version = "0.1.0"
 dependencies = [
+ "hyphae-core",
  "libc",
  "serde_json",
 ]

@@ -15,8 +15,66 @@ use std::path::PathBuf;
 use hyphae_errors::HyphaeError;
 use tracing::warn;
 
-use crate::config::VsockConfig;
+use crate::config::{VmConfig, VsockConfig};
 use crate::jail::JailConfig;
+
+/// Percent-encode one component (key or value) of a `hyphae.env.*` boot arg.
+///
+/// Encodes `%` → `%25`, space → `%20`, newline → `%0A`. Keys additionally
+/// encode `=` → `%3D` so the first `=` in the token always separates key
+/// from value.
+fn encode_env_component(s: &str, is_key: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            ' ' => out.push_str("%20"),
+            '\n' => out.push_str("%0A"),
+            '=' if is_key => out.push_str("%3D"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Encode runtime env vars as `hyphae.env.KEY=VALUE` kernel boot arguments.
+///
+/// We use the kernel command line as the injection mechanism because the
+/// launch paths spawn Firecracker without pre-boot API-socket MMDS setup.
+/// Encoding: `hyphae.env.KEY=VALUE` per var, percent-encoding `=`, spaces,
+/// newlines, and `%` to survive kernel cmdline parsing. `hyphae-init` reads
+/// `/proc/cmdline` and strips the prefix to reconstruct vars (see
+/// `hyphae-init/src/main.rs`).
+///
+/// Keys are emitted in sorted order so the encoding is deterministic.
+/// Shared by both the direct and jailed launch paths — they must produce
+/// byte-identical arguments.
+pub fn env_boot_args(env_vars: &HashMap<String, String>) -> Vec<String> {
+    let mut keys: Vec<&String> = env_vars.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .map(|k| {
+            let key = encode_env_component(k, true);
+            let val = encode_env_component(env_vars.get(k).expect("key present"), false);
+            format!("hyphae.env.{key}={val}")
+        })
+        .collect()
+}
+
+/// Append the encoded `hyphae.env.*` boot arguments to a [`VmConfig`], if any
+/// env vars are set. Used by both launch paths so env injection stays in
+/// lockstep between direct and jailed mode.
+pub(crate) fn apply_env_boot_args(
+    vm_config: VmConfig,
+    env_vars: Option<&HashMap<String, String>>,
+) -> VmConfig {
+    match env_vars {
+        Some(vars) if !vars.is_empty() => {
+            vm_config.with_additional_boot_args(env_boot_args(vars).join(" "))
+        }
+        _ => vm_config,
+    }
+}
 
 /// Selects whether the VM runs with or without jailer isolation.
 pub enum LaunchMode {
@@ -134,5 +192,120 @@ pub async fn launch(mut config: LaunchConfig) -> Result<LaunchResult, HyphaeErro
             direct::launch_direct(config).await
         }
         LaunchMode::Jailed(jail_config) => jailed::launch_jailed(config, jail_config).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn varmap(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn env_boot_args_encodes_spaces_and_percent_in_keys_and_values() {
+        let args = env_boot_args(&varmap(&[
+            ("GREETING", "hello world"),
+            ("SPICY", "100% done"),
+        ]));
+
+        assert_eq!(
+            args,
+            vec![
+                "hyphae.env.GREETING=hello%20world".to_string(),
+                "hyphae.env.SPICY=100%25%20done".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn env_boot_args_encodes_equals_in_keys_and_newlines_in_values() {
+        let args = env_boot_args(&varmap(&[("A=B", "line one\nline two")]));
+
+        assert_eq!(
+            args,
+            vec!["hyphae.env.A%3DB=line%20one%0Aline%20two".to_string()]
+        );
+    }
+
+    #[test]
+    fn env_boot_args_emits_sorted_keys_in_golden_format() {
+        // The exact vars the buzz-agent bundle ships; this is the byte format
+        // the direct path has always produced and hyphae-init decodes.
+        let args = env_boot_args(&varmap(&[
+            ("MODEL_NAME", "muse-glimmer-30b"),
+            ("MODEL_BASE_URL", "http://192.168.105.168:8000/v1"),
+        ]));
+
+        assert_eq!(
+            args.join(" "),
+            "hyphae.env.MODEL_BASE_URL=http://192.168.105.168:8000/v1 hyphae.env.MODEL_NAME=muse-glimmer-30b"
+        );
+    }
+
+    #[test]
+    fn env_boot_args_empty_map_yields_no_args() {
+        assert!(env_boot_args(&HashMap::new()).is_empty());
+    }
+
+    #[test]
+    fn apply_env_boot_args_skips_none_and_empty() {
+        let base = VmConfig::new("kernel", "rootfs", 2, 1024).with_boot_args("console=ttyS0");
+
+        let untouched = apply_env_boot_args(base.clone(), None);
+        let empty = apply_env_boot_args(base.clone(), Some(&HashMap::<String, String>::new()));
+
+        assert_eq!(
+            untouched.boot_source.boot_args,
+            Some("console=ttyS0".to_string())
+        );
+        assert_eq!(
+            empty.boot_source.boot_args,
+            Some("console=ttyS0".to_string())
+        );
+    }
+
+    #[test]
+    fn direct_and_jailed_paths_inject_identical_env_boot_args() {
+        // Parity: both launch modules call apply_env_boot_args at the same
+        // position in their construction sequence (after extra boot args,
+        // before volume args). Simulating each module's VmConfig construction
+        // up to that point must yield byte-identical boot_args afterwards —
+        // only the drive paths differ between the modes, never the env args.
+        let env_vars = varmap(&[
+            ("MODEL_NAME", "muse glimmer 30b"),
+            ("MODEL_BASE_URL", "http://192.168.105.168:8000/v1"),
+            ("PROMPT", "key=val 100%\nmulti line"),
+        ]);
+
+        // direct.rs builds VmConfig with ABSOLUTE paths.
+        let mut direct_vm = VmConfig::new("/srv/kernel/vmlinux", "/srv/rootfs/ext4.img", 2, 1024)
+            .with_boot_args("console=ttyS0 reboot=k panic=1");
+        direct_vm = apply_env_boot_args(direct_vm, Some(&env_vars));
+
+        // jailed.rs builds VmConfig with RELATIVE (chroot) paths.
+        let mut jailed_vm = VmConfig::new("vmlinux", "ext4.img", 2, 1024)
+            .with_boot_args("console=ttyS0 reboot=k panic=1");
+        jailed_vm = apply_env_boot_args(jailed_vm, Some(&env_vars));
+
+        let direct_args = direct_vm.boot_source.boot_args.expect("set");
+        let jailed_args = jailed_vm.boot_source.boot_args.expect("set");
+
+        let env_tokens = |args: &str| -> Vec<String> {
+            args.split_whitespace()
+                .filter(|t| t.starts_with("hyphae.env."))
+                .map(str::to_string)
+                .collect()
+        };
+
+        assert_eq!(env_tokens(&direct_args), env_tokens(&jailed_args));
+        assert_eq!(env_tokens(&direct_args).len(), 3);
+        // The env segment always lands after the default args, space-separated.
+        assert!(direct_args.starts_with("console=ttyS0 reboot=k panic=1 "));
+        assert!(jailed_args.starts_with("console=ttyS0 reboot=k panic=1 "));
     }
 }

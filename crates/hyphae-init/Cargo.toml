@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 libc = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+hyphae-core = { path = "../hyphae-core" }

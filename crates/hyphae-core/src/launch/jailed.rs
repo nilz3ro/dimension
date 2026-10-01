@@ -163,6 +163,17 @@ async fn launch_jailed_inner(
         vm_config = vm_config.with_additional_boot_args(extra);
     }
 
+    // Inject runtime env vars via kernel boot args, using the exact same
+    // encoded construction as the direct path (`launch/direct.rs`): both
+    // paths call the shared `apply_env_boot_args` helper so the
+    // `hyphae.env.KEY=VALUE` arguments — percent-encoding `=`, spaces,
+    // newlines, and `%` — are byte-identical in direct and jailed mode.
+    // hyphae-init decodes them from /proc/cmdline at guest boot and applies
+    // them to the agent process; previously only the direct path injected
+    // these, so jailed runs (the production path) never saw manifest [env]
+    // vars like MODEL_BASE_URL / MODEL_NAME.
+    vm_config = super::apply_env_boot_args(vm_config, config.env_vars.as_ref());
+
     // Wire in volume drive if present (Phase 17 populates LaunchConfig.volume_drive).
     // In jailed mode, the drive path must be relative (just the filename) because
     // Firecracker runs inside a chroot. The actual file will be staged as an

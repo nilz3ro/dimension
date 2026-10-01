@@ -71,24 +71,12 @@ pub async fn launch_direct(config: LaunchConfig) -> Result<LaunchResult, HyphaeE
     // without using the pre-boot API socket. MMDS requires pre-boot API calls
     // (PUT /mmds/config, PUT /mmds) which are not possible in this flow.
     //
-    // Encoding: `hyphae.env.KEY=VALUE` per var, percent-encoding `=` and
-    // spaces in values to survive kernel cmdline parsing. hyphae-init reads
-    // /proc/cmdline and strips the prefix to reconstruct vars.
-    if let Some(ref env_vars) = config.env_vars {
-        if !env_vars.is_empty() {
-            let boot_args: Vec<String> = env_vars
-                .iter()
-                .map(|(k, v)| {
-                    // Percent-encode characters that would break kernel cmdline parsing:
-                    // spaces → %20, equals → %3D, newlines → %0A
-                    let encoded_key = k.replace('%', "%25").replace(' ', "%20").replace('=', "%3D").replace('\n', "%0A");
-                    let encoded_val = v.replace('%', "%25").replace(' ', "%20").replace('\n', "%0A");
-                    format!("hyphae.env.{}={}", encoded_key, encoded_val)
-                })
-                .collect();
-            vm_config = vm_config.with_additional_boot_args(boot_args.join(" "));
-        }
-    }
+    // Encoding and appending live in the shared `apply_env_boot_args` helper
+    // so the direct and jailed paths stay byte-identical: `hyphae.env.KEY=VALUE`
+    // per var, percent-encoding `=`, spaces, and newlines to survive kernel
+    // cmdline parsing. hyphae-init reads /proc/cmdline and strips the prefix
+    // to reconstruct vars.
+    vm_config = super::apply_env_boot_args(vm_config, config.env_vars.as_ref());
 
     // Attach secondary volume drive if present (Phase 17 populates this).
     // The drive appears as /dev/vdb inside the guest; hyphae-init mounts it

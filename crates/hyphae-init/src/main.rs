@@ -253,19 +253,27 @@ fn c_str(s: &str) -> std::ffi::CString {
 
 /// Read runtime env vars injected via kernel boot args from `/proc/cmdline`.
 ///
-/// The direct launch path encodes runtime env vars as `hyphae.env.KEY=VALUE`
-/// kernel command line parameters (see `launch/direct.rs`). This function
-/// parses `/proc/cmdline` and returns the decoded key-value pairs.
+/// The launch paths (direct and jailed) encode runtime env vars as
+/// `hyphae.env.KEY=VALUE` kernel command line parameters (see
+/// `hyphae-core/src/launch/mod.rs`). This function reads `/proc/cmdline`
+/// and returns the decoded key-value pairs via [`parse_runtime_env`].
 ///
 /// Values may contain percent-encoded characters: `%20` → space, `%3D` → `=`,
 /// `%0A` → newline, `%25` → `%`.
 #[cfg(target_os = "linux")]
 fn read_runtime_env_from_cmdline() -> Vec<(String, String)> {
-    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
-        Ok(c) => c,
-        Err(_) => return Vec::new(),
-    };
+    match std::fs::read_to_string("/proc/cmdline") {
+        Ok(c) => parse_runtime_env(&c),
+        Err(_) => Vec::new(),
+    }
+}
 
+/// Parse `hyphae.env.KEY=VALUE` tokens out of a kernel command line.
+///
+/// Pure function shared with tests: the hyphae-core encoder
+/// (`launch::env_boot_args`) and this decoder are kept in lockstep by the
+/// round-trip tests at the bottom of this file.
+fn parse_runtime_env(cmdline: &str) -> Vec<(String, String)> {
     let mut vars = Vec::new();
     const PREFIX: &str = "hyphae.env.";
 
@@ -283,7 +291,6 @@ fn read_runtime_env_from_cmdline() -> Vec<(String, String)> {
 
 /// Decode percent-encoded sequences in a string.
 /// Handles: %25 → %, %20 → space, %3D → =, %0A → newline.
-#[cfg(target_os = "linux")]
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut result = String::with_capacity(s.len());
@@ -672,4 +679,67 @@ mod tests {
         assert_eq!(args, vec!["hello"]);
     }
 
+}
+
+#[cfg(test)]
+mod env_roundtrip_tests {
+    //! Parity tests: the hyphae-core launch encoder (`env_boot_args`) and the
+    //! decoder used at guest boot (`parse_runtime_env` + `percent_decode`)
+    //! must round-trip every value the manifest [env] section can carry.
+    use std::collections::HashMap;
+
+    fn roundtrip(vars: &[(&str, &str)]) -> Vec<(String, String)> {
+        let map: HashMap<String, String> = vars
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let cmdline = hyphae_core::launch::env_boot_args(&map).join(" ");
+        // Embed the tokens in a realistic full cmdline, the way the kernel
+        // presents /proc/cmdline, to prove neighbors and defaults are inert.
+        let full = format!("console=ttyS0 reboot=k panic=1 {cmdline} hyphae.volume=true");
+        super::parse_runtime_env(&full)
+    }
+
+    #[test]
+    fn plain_vars_roundtrip() {
+        let decoded = roundtrip(&[
+            ("MODEL_BASE_URL", "http://192.168.105.168:8000/v1"),
+            ("MODEL_NAME", "muse-glimmer-30b"),
+        ]);
+        let sorted: Vec<_> = decoded.into_iter().map(|(k, _)| k).collect();
+        // Keys come back sorted (encoder emits sorted keys).
+        assert_eq!(sorted, vec!["MODEL_BASE_URL", "MODEL_NAME"]);
+    }
+
+    #[test]
+    fn spaces_percent_equals_newlines_roundtrip() {
+        let decoded = roundtrip(&[("PROMPT", "key=val 100% sure\nsecond line")]);
+        assert_eq!(
+            decoded,
+            vec![(
+                "PROMPT".to_string(),
+                "key=val 100% sure\nsecond line".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn equals_sign_in_key_roundtrips() {
+        let decoded = roundtrip(&[("A=B", "x")]);
+        assert_eq!(decoded, vec![("A=B".to_string(), "x".to_string())]);
+    }
+
+    #[test]
+    fn empty_value_roundtrips() {
+        let decoded = roundtrip(&[("EMPTY", "")]);
+        assert_eq!(decoded, vec![("EMPTY".to_string(), "".to_string())]);
+    }
+
+    #[test]
+    fn non_env_tokens_are_ignored() {
+        let decoded = super::parse_runtime_env(
+            "console=ttyS0 hyphae.volume=true hyphae.env.ONLY=one not-env.x=1",
+        );
+        assert_eq!(decoded, vec![("ONLY".to_string(), "one".to_string())]);
+    }
 }
