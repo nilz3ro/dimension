@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use hyphae_core::jail::{JailConfig, validate_jail_user};
+use hyphae_core::net::LanAllow;
 use hyphae_core::launch::LaunchMode;
 use hyphae_errors::JailError;
 
@@ -49,6 +50,13 @@ pub struct OrchestrationConfig {
     /// When true, create TAP devices and NAT rules for VM internet access.
     pub enable_network: bool,
 
+    /// Destination-scoped LAN exceptions (`CIDR:PORT`, TCP only) applied
+    /// when NAT is enabled. Empty preserves full LAN isolation. The
+    /// gateway's own deployment orchestration does not run NAT'd local
+    /// VMs, so this stays empty here; the worker populates it from
+    /// `DIMENSION_LAN_ALLOW`.
+    pub lan_allow: Vec<LanAllow>,
+
     /// When true, guest stderr output is suppressed (logged server-side only).
     /// When false, stderr is forwarded to the client as a BackendEvent::Message.
     /// Defaults to `true` to preserve existing behavior.
@@ -78,6 +86,7 @@ impl Default for OrchestrationConfig {
             firecracker_bin: PathBuf::from("firecracker"),
             mock: false,
             enable_network: false,
+            lan_allow: Vec::new(),
             suppress_guest_stderr: true,
             jailer_bin: None,
             require_jail: false,

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 
+use hyphae_core::net::LanAllow;
 use hyphae_core::orchestrator::{ProgressFn, RunRequest};
 use hyphae_core::orchestrator::Orchestrator;
 use hyphae_core::registry::storage::default_data_dir;
@@ -13,6 +14,13 @@ pub async fn execute(args: RunArgs, output: &OutputConfig) -> Result<()> {
     let registry = Registry::open(&data_dir).context("Failed to open registry")?;
     let orchestrator = Orchestrator::new(registry);
 
+    let lan_allow = args
+        .lan_allow
+        .iter()
+        .map(|spec| LanAllow::parse(spec).map_err(anyhow::Error::from))
+        .collect::<Result<Vec<_>, _>>()
+        .context("invalid --lan-allow entry")?;
+
     let request = RunRequest {
         reference: args.bundle,
         kernel_path: args.kernel,
@@ -20,6 +28,7 @@ pub async fn execute(args: RunArgs, output: &OutputConfig) -> Result<()> {
         memory_mib: args.memory,
         boot_args: args.boot_args,
         enable_network: args.network,
+        lan_allow,
         no_nat: args.no_nat,
         jail: args.jail,
         vsock: None,

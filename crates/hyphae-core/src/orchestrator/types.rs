@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
+use crate::net::LanAllow;
+
 /// Progress callback type. The orchestrator calls this with human-readable
 /// status messages during pipeline execution. The library never formats
 /// output directly -- callers provide the formatting via this callback.
@@ -129,6 +131,9 @@ pub struct RunRequest {
     pub boot_args: Option<String>,
     /// Whether to set up TAP + NAT networking.
     pub enable_network: bool,
+    /// Destination-scoped LAN exceptions for NAT'd runs (`CIDR:PORT`,
+    /// TCP only). Empty preserves full LAN isolation.
+    pub lan_allow: Vec<LanAllow>,
     /// Skip NAT/masquerade rules even with networking enabled.
     pub no_nat: bool,
     /// Run VM in Firecracker jailer sandbox (opt-in, requires root).

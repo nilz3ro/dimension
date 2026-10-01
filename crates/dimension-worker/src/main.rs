@@ -18,6 +18,7 @@ use tracing::{debug, info, warn};
 
 use dimension_gateway::orchestration::config::{CidAllocator, OrchestrationConfig};
 use dimension_gateway::orchestration::deployment::DeploymentVmManager;
+use hyphae_core::net::LanAllow;
 
 mod config;
 mod events;
@@ -102,6 +103,30 @@ async fn main() {
     });
 
     let cid_allocator = Arc::new(CidAllocator::new());
+    // Parse the LAN allowlist up front so an invalid entry fails startup
+    // (fail closed) rather than silently widening or narrowing egress.
+    let lan_allow: Vec<LanAllow> = config
+        .lan_allow
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(LanAllow::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| {
+            eprintln!("invalid DIMENSION_LAN_ALLOW entry: {e}");
+            std::process::exit(1);
+        });
+    if !lan_allow.is_empty() {
+        info!(
+            entries = lan_allow
+                .iter()
+                .map(|e| format!("{}:{}", e.cidr, e.port))
+                .collect::<Vec<_>>()
+                .join(","),
+            "worker: LAN egress allowlist active"
+        );
+    }
+
     let orch_config = OrchestrationConfig {
         boot_timeout: Duration::from_secs(config.boot_timeout_secs),
         processing_timeout: Duration::from_secs(config.processing_timeout_secs),
@@ -111,6 +136,7 @@ async fn main() {
         firecracker_bin: config.firecracker_bin.clone(),
         mock: false,
         enable_network: config.enable_network,
+        lan_allow,
         suppress_guest_stderr: true,
         jailer_bin,
         require_jail: config.require_jail,

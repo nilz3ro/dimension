@@ -341,6 +341,9 @@ pub enum NetworkError {
 
     #[error("[E808] failed to generate MAC address for TAP index {index}: index exceeds 24-bit range")]
     MacAddressOverflow { index: u32 },
+
+    #[error("[E809] invalid LAN allowlist entry: {0}")]
+    InvalidLanAllow(String),
 }
 
 /// Errors from jailer subsystem (E811-E821).

@@ -197,7 +197,8 @@ impl DeploymentVmManager {
         let network = if self.orch_config.enable_network {
             let mut allocator = self.subnet_allocator.lock()
                 .map_err(|e| anyhow::anyhow!("subnet allocator lock poisoned: {e}"))?;
-            let resources = setup_vm_network(&mut allocator, false)
+            // No NAT for deployment-local VMs: no allowlist to apply.
+            let resources = setup_vm_network(&mut allocator, false, &[])
                 .map_err(|e| anyhow::anyhow!("network setup failed: {e}"))?;
             // Copy fields before forgetting resources so Drop doesn't teardown the TAP.
             // Deployment VMs are long-lived; TAP cleanup happens on stop().

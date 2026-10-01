@@ -570,7 +570,7 @@ impl WorkerService for WorkerServiceImpl {
         // it is cleaned up when the VM process exits via the drop chain.
         let network = if self.orch_config.enable_network {
             let mut allocator = self.subnet_allocator.lock().await;
-            let resources = setup_vm_network(&mut allocator, true)
+            let resources = setup_vm_network(&mut allocator, true, &self.orch_config.lan_allow)
                 .map_err(|e| Status::internal(format!("network setup failed: {e}")))?;
             let net_config = NetworkConfig {
                 tap_name: resources.allocation.tap_name.clone(),

@@ -12,7 +12,7 @@ pub mod nat;
 pub mod tap;
 
 pub use ip_alloc::{generate_mac, SubnetAllocation, SubnetAllocator};
-pub use nat::NatRules;
+pub use nat::{LanAllow, NatRules};
 pub use tap::TapDevice;
 
 use hyphae_errors::NetworkError;
@@ -51,7 +51,9 @@ impl Drop for VmNetworkResources {
 ///
 /// 1. Allocates a /30 subnet (index, IPs, MAC, TAP name)
 /// 2. Creates the TAP device with the allocated IPs
-/// 3. Optionally adds NAT rules for internet access
+/// 3. Optionally adds NAT rules for internet access, honoring the
+///    destination-scoped [`LanAllow`] allowlist (empty = unchanged
+///    LAN isolation)
 ///
 /// On partial failure, cleans up all previously created resources:
 /// - If TAP creation fails, releases the subnet allocation
@@ -59,6 +61,7 @@ impl Drop for VmNetworkResources {
 pub fn setup_vm_network(
     allocator: &mut SubnetAllocator,
     enable_nat: bool,
+    lan_allow: &[LanAllow],
 ) -> Result<VmNetworkResources, NetworkError> {
     let alloc = allocator.allocate()?;
 
@@ -71,7 +74,7 @@ pub fn setup_vm_network(
     };
 
     let nat = if enable_nat {
-        match NatRules::add(&alloc.tap_name, alloc.guest_ip) {
+        match NatRules::add(&alloc.tap_name, alloc.guest_ip, lan_allow) {
             Ok(nat) => Some(nat),
             Err(e) => {
                 allocator.release(alloc.index);

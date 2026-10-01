@@ -107,6 +107,14 @@ pub struct RunArgs {
     #[arg(long)]
     pub no_nat: bool,
 
+    /// Allow guest egress to one LAN destination TCP port
+    /// (repeatable, requires --network). Format: CIDR:PORT, e.g.
+    /// `--lan-allow 192.168.105.168/32:8000`. These exceptions are
+    /// inserted before the RFC1918 drops; all other LAN destinations
+    /// remain blocked.
+    #[arg(long = "lan-allow", value_name = "CIDR:PORT")]
+    pub lan_allow: Vec<String>,
+
     /// Run VM in Firecracker jailer sandbox (requires root, hyphae system user)
     #[arg(long)]
     pub jail: bool,

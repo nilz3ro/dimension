@@ -119,7 +119,7 @@ impl Orchestrator {
         let network = if request.enable_network {
             emit("setting up VM network (TAP device, subnet allocation)");
             let mut allocator = SubnetAllocator::new();
-            let resources = setup_vm_network(&mut allocator, !request.no_nat)?;
+            let resources = setup_vm_network(&mut allocator, !request.no_nat, &request.lan_allow)?;
 
             let net_config = NetworkConfig {
                 tap_name: resources.allocation.tap_name.clone(),

@@ -77,6 +77,16 @@ pub struct WorkerConfig {
     #[arg(long, default_value_t = false, env = "DIMENSION_ENABLE_NETWORK")]
     pub enable_network: bool,
 
+    /// Destination-scoped LAN egress exceptions for NAT'd guest VMs,
+    /// comma-separated `CIDR:PORT` entries (TCP only), e.g.
+    /// `DIMENSION_LAN_ALLOW=192.168.105.168/32:8000`. Each entry permits
+    /// guest traffic to exactly that destination/port and is inserted
+    /// before the RFC1918 drops; every other private destination stays
+    /// blocked. Invalid entries fail startup. Requires
+    /// --enable-network/DIMENSION_ENABLE_NETWORK.
+    #[arg(long = "lan-allow", env = "DIMENSION_LAN_ALLOW", default_value = "")]
+    pub lan_allow: String,
+
     /// PostgreSQL connection URL for platform dispatch stores.
     /// When set, the worker connects to Postgres on startup and constructs
     /// a DispatchContext so that guest ServiceRequests (webhooks, session

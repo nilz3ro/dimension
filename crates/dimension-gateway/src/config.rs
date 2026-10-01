@@ -174,6 +174,7 @@ impl AppConfig {
             firecracker_bin: self.firecracker_bin.clone(),
             mock: self.mock,
             enable_network: self.enable_network,
+            lan_allow: Vec::new(),
             // Default to suppressing guest stderr (existing behavior).
             // Future: expose as CLI flag if needed.
             suppress_guest_stderr: true,
