@@ -22,6 +22,25 @@ importers:
         specifier: ^5.9.3
         version: 5.9.3
 
+  packages/buzz-agent:
+    dependencies:
+      '@dimension-agents/shared':
+        specifier: workspace:*
+        version: link:../shared
+      '@mariozechner/pi-ai':
+        specifier: ^0.53.0
+        version: 0.53.1(ws@8.19.0)(zod@3.25.76)
+    devDependencies:
+      '@types/node':
+        specifier: ^25.2.3
+        version: 25.5.0
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.1
+        version: 3.2.4(@types/node@25.5.0)(tsx@4.21.0)
+
   packages/coder:
     dependencies:
       '@dimension-agents/shared':

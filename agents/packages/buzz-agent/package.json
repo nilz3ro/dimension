@@ -1,0 +1,21 @@
+{
+  "name": "@dimension-agents/buzz-agent",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "check": "tsc --noEmit",
+    "test": "pnpm --filter @dimension-agents/shared build && pnpm build && vitest run",
+    "start": "node dist/agent.js"
+  },
+  "dependencies": {
+    "@dimension-agents/shared": "workspace:*",
+    "@mariozechner/pi-ai": "^0.53.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.1"
+  }
+}
